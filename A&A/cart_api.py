@@ -11,6 +11,17 @@ def _ensure_cart():
         session['cart'] = {'items': []}
     return session['cart']
 
+def _to_inr(amount: float) -> float:
+    """Convert a USD amount to INR using USD_TO_INR env var (default 83)."""
+    try:
+        rate = float(os.getenv('USD_TO_INR', '83'))
+        return round(float(amount or 0) * rate, 2)
+    except Exception:
+        try:
+            return round(float(amount or 0), 2)
+        except Exception:
+            return 0.0
+
 def _item_key(item_type, item_id, action):
     return f"{item_type}-{item_id}-{action}"
 
@@ -27,7 +38,7 @@ def _fetch_item_details(item_type, item_id, action):
         if not row:
             return None
         unit_price = row['buy_price'] if action == 'buy' else row['rent_price']
-        return {'title': row['title'], 'unit_price': float(unit_price)}
+        return {'title': row['title'], 'unit_price': _to_inr(unit_price)}
     elif item_type == 'game':
         dbp = os.path.join(current_app.instance_path, 'games.db')
         conn = sqlite3.connect(dbp)
@@ -40,7 +51,7 @@ def _fetch_item_details(item_type, item_id, action):
             return None
         # If your games table uses different column names, adjust above fields accordingly
         unit_price = row['buy_price'] if action == 'buy' else row['rent_price']
-        return {'title': row['title'], 'unit_price': float(unit_price)}
+        return {'title': row['title'], 'unit_price': _to_inr(unit_price)}
     return None
 
 def _totals(items):
@@ -76,6 +87,9 @@ def _ensure_purchase_history_table(conn):
     existing = {row[1] for row in cur.fetchall()}
     if 'payment_method' not in existing:
         cur.execute("ALTER TABLE purchase_history ADD COLUMN payment_method TEXT")
+        conn.commit()
+    if 'delivery_status' not in existing:
+        cur.execute("ALTER TABLE purchase_history ADD COLUMN delivery_status TEXT DEFAULT 'Processing'")
         conn.commit()
 
 @cart_bp.route('', methods=['GET'])
@@ -194,8 +208,8 @@ def checkout():
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO purchase_history (user_id, purchase_date, total_amount, buyer_name, buyer_email, payment_method, items_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO purchase_history (user_id, purchase_date, total_amount, buyer_name, buyer_email, payment_method, items_json, delivery_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(session.get('user_id') or 0),
@@ -204,7 +218,8 @@ def checkout():
                 buyer.get('name', ''),
                 buyer.get('email', ''),
                 payment_method,
-                json.dumps(items)
+                json.dumps(items),
+                'Processing'
             )
         )
         conn.commit()

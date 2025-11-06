@@ -46,7 +46,7 @@
               {{ it.title }} <span class="pill">{{ it.item_type|capitalize }} • {{ 'Buy' if it.action=='buy' else 'Rent' }}</span>
             </div>
             <div class="qty">x{{ it.quantity }}</div>
-            <div class="price">${{ '%.2f'|format(it.unit_price * it.quantity) }}</div>
+            <div class="price">₹{{ '%.2f'|format(it.unit_price * it.quantity) }}</div>
             <div class="actions">
               <button class="btn-danger" onclick="removeItem('{{ it.key }}')">Remove</button>
             </div>
@@ -55,7 +55,7 @@
       </div>
 
       <div class="summary">
-        <div><strong>Subtotal:</strong> $<span id="subtotal">{{ '%.2f'|format(subtotal) }}</span></div>
+  <div><strong>Subtotal:</strong> ₹<span id="subtotal">{{ '%.2f'|format(subtotal) }}</span></div>
         <div>
           <button class="btn-secondary" data-history-url="{{ url_for('history_page') }}" onclick="goHistory(this)">History</button>
           <button class="btn-secondary" onclick="clearCart()">Clear Cart</button>

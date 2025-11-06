@@ -102,6 +102,12 @@ The app will start on http://127.0.0.1:5000 by default.
 	- `CAFE_DEFAULT_DURATION` (default `60`)
 	- `CAFE_SLOT_CAPACITY` (default `10`)
 
+- Currency & pricing:
+	- `USD_TO_INR` — conversion rate used by the Jinja `inr` filter (default `83`). Catalog base prices (stored in USD) convert at render time; cart line item unit prices and purchase totals are stored already converted to INR.
+
+- Persistence:
+	- `INSTANCE_PATH` — override Flask instance folder path (e.g. `/var/data/arcade-instance`) for deployments needing persistent disks.
+
 ## 🗄️ Data storage
 
 All databases live under `instance/` and are created automatically on first use:
@@ -111,6 +117,14 @@ All databases live under `instance/` and are created automatically on first use:
 - `games.db` — purchase_history (writes on checkout)
 - `cafe.db` — cafe_bookings
 - `community.db` — community_subscribers, community_messages
+
+Purchase history now includes a `delivery_status` column with lifecycle values:
+
+- `Processing` (default when order is created)
+- `Out for delivery`
+- `Delivered` (admin endpoint maps `Success`/`Successful` inputs to `Delivered`)
+
+Admins update status via the dashboard dropdown; users see a status badge beside each order in `/history`.
 
 User-uploaded avatars are saved under `static/uploads/community/`.
 
@@ -170,4 +184,4 @@ rm -f A\&A/static/uploads/community/*  # Linux/macOS
 
 ## ✅ Status
 
-This is a complete, runnable demo showcasing catalog + commerce flow, bookings, admin dashboards, and community messaging with profiles, wrapped in a cohesive glass UI.
+This is a complete, runnable demo showcasing catalog + commerce flow (with INR conversion and delivery status tracking), bookings, admin dashboards, and community messaging with profiles, wrapped in a cohesive glass UI.

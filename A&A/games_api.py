@@ -40,6 +40,9 @@ def init_purchase_history_db(conn):
     if 'payment_method' not in cols:
         cur.execute("ALTER TABLE purchase_history ADD COLUMN payment_method TEXT")
         conn.commit()
+    if 'delivery_status' not in cols:
+        cur.execute("ALTER TABLE purchase_history ADD COLUMN delivery_status TEXT DEFAULT 'Processing'")
+        conn.commit()
 
 def init_db(conn):
     cur = conn.cursor()
@@ -135,9 +138,9 @@ def save_purchase():
         cur = conn.cursor()
         cur.execute(
             """INSERT INTO purchase_history 
-               (user_id, purchase_date, total_amount, buyer_name, buyer_email, payment_method, items_json) 
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, purchase_date, total_amount, buyer_name, buyer_email, payment_method, items_json)
+               (user_id, purchase_date, total_amount, buyer_name, buyer_email, payment_method, items_json, delivery_status) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, purchase_date, total_amount, buyer_name, buyer_email, payment_method, items_json, 'Processing')
         )
         conn.commit()
         purchase_id = cur.lastrowid
@@ -185,7 +188,8 @@ def get_purchase_history():
                     "name": row['buyer_name'],
                     "email": row['buyer_email']
                 },
-                "items": items
+                "items": items,
+                "deliveryStatus": row['delivery_status'] if 'delivery_status' in row.keys() else None
             })
         
         conn.close()

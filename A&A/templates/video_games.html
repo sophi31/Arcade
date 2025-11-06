@@ -203,8 +203,8 @@
                         <p class="game-description">{{ g.description }}</p>
 
                         <div class="game-prices">
-                            <span class="price buy-price">Buy: ${{ '%.2f'|format(g.buy_price) }}</span>
-                            <span class="price rent-price">Rent: ${{ '%.2f'|format(g.rent_price) }}</span>
+                            <span class="price buy-price">Buy: {{ g.buy_price|inr }}</span>
+                            <span class="price rent-price">Rent: {{ g.rent_price|inr }}</span>
                         </div>
 
                         <div class="game-actions">

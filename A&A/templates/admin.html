@@ -138,6 +138,7 @@
             <th>User</th>
             <th>Date</th>
             <th style="text-align:right;">Amount</th>
+            <th>Delivery</th>
             <th>Method</th>
           </tr>
         </thead>
@@ -148,6 +149,14 @@
             <td>{{ p.user_id }}</td>
             <td>{{ p.purchase_date }}</td>
             <td style="text-align:right;">₹{{ '%.2f'|format(p.total_amount|float) }}</td>
+            <td>
+              {% set ds = (p.delivery_status or 'Processing') %}
+              <select class="delivery-select" data-pid="{{ p.id }}">
+                <option value="Processing" {{ 'selected' if ds=='Processing' else '' }}>Processing</option>
+                <option value="Out for delivery" {{ 'selected' if ds=='Out for delivery' else '' }}>Out for delivery</option>
+                <option value="Delivered" {{ 'selected' if ds=='Delivered' else '' }}>Delivered</option>
+              </select>
+            </td>
             <td>
               {% set method = (p.payment_method or 'Demo')|lower %}
               {% if method == 'card' %}<span class="pill pill-blue">💳 Card</span>
@@ -279,5 +288,22 @@ document.addEventListener('DOMContentLoaded', function() {
       el.style.width = Math.min(100, Math.max(0, pct)) + '%';
     }
   });
+});
+</script>
+
+<script>
+// Handle delivery status updates
+document.addEventListener('change', function(e){
+  const sel = e.target.closest('.delivery-select');
+  if (!sel) return;
+  const pid = sel.getAttribute('data-pid');
+  const status = sel.value;
+  fetch(`/admin/purchase/${pid}/delivery`, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({ status })
+  }).then(r => r.json()).then(d => {
+    if (!d.success) alert(d.error || 'Failed to update status');
+  }).catch(()=> alert('Network error'));
 });
 </script>

@@ -48,6 +48,27 @@ def create_app(config=None):
 
     db.init_app(app)
 
+    # ---- Currency helpers ----
+    @app.template_filter('inr')
+    def inr_filter(value):
+        """Convert a numeric USD value to INR using USD_TO_INR env (default 83)."""
+        try:
+            rate = float(os.getenv('USD_TO_INR', '83'))
+            amt = float(value or 0) * rate
+            return f"₹{amt:,.2f}"
+        except Exception:
+            try:
+                return f"₹{float(value):,.2f}"
+            except Exception:
+                return "₹0.00"
+
+    @app.context_processor
+    def inject_currency():
+        return {
+            'currency_symbol': '₹',
+            'usd_to_inr_rate': float(os.getenv('USD_TO_INR', '83'))
+        }
+
     @app.before_request
     def create_tables():
         if not hasattr(app, 'db_initialized'):
@@ -1169,6 +1190,41 @@ def create_app(config=None):
             daily_revenue=daily_list,
             daily_max=daily_max
         )
+
+    @app.route('/admin/purchase/<int:pid>/delivery', methods=['POST'])
+    def admin_update_delivery(pid: int):
+        # Admin-only endpoint to update delivery status
+        if not (session.get('user') or session.get('user_id')):
+            return redirect(url_for('login'))
+        if not _is_admin():
+            return jsonify({'error': 'Admins only'}), 403
+        data = request.get_json(silent=True) or {}
+        status = (data.get('status') or '').strip()
+        allowed = {
+            'Processing', 'Out for delivery', 'Delivered'
+        }
+        # Accept lower-case shorthands
+        m = {
+            'processing': 'Processing',
+            'out': 'Out for delivery',
+            'out for delivery': 'Out for delivery',
+            'delivered': 'Delivered',
+            'successful': 'Delivered',
+            'success': 'Delivered'
+        }
+        status_norm = m.get(status.lower(), status)
+        if status_norm not in allowed:
+            return jsonify({'error': 'Invalid status'}), 400
+        try:
+            dbp = os.path.join(app.instance_path, 'games.db')
+            conn = sqlite3.connect(dbp)
+            cur = conn.cursor()
+            cur.execute("UPDATE purchase_history SET delivery_status=? WHERE id=?", (status_norm, pid))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'status': status_norm})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
 
     @app.route('/admin/revenue.csv')
     def admin_revenue_csv():

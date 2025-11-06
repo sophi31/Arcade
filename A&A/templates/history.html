@@ -20,6 +20,9 @@
     .muted { opacity:.85; }
     .items { margin-top:.5rem; display:grid; gap:.3rem; }
   .pill { font-size:.8rem; padding:.2rem .5rem; border-radius:999px; background: rgba(255,255,255,0.15); margin-left:.5rem; }
+  .ds-processing { background: rgba(59,130,246,0.25); border:1px solid rgba(59,130,246,0.5); }
+  .ds-out { background: rgba(234,179,8,0.25); border:1px solid rgba(234,179,8,0.5); }
+  .ds-delivered { background: rgba(34,197,94,0.25); border:1px solid rgba(34,197,94,0.5); }
   /* Payment method color tags */
   .pm-card { background: rgba(37,99,235,0.25); border:1px solid rgba(37,99,235,0.45); }
   .pm-upi { background: rgba(22,163,74,0.25); border:1px solid rgba(22,163,74,0.45); }
@@ -60,18 +63,20 @@
           const buyer = h.buyer?.name || '';
           const email = h.buyer?.email || '';
           const pay = h.paymentMethod || 'Demo';
+          const ds = deliveryBadge(h.deliveryStatus || h.delivery_status);
           div.innerHTML = `
             <div class="top">
               <div>
                 <strong>Order #${h.id}</strong>
                 <span class="pill">${date}</span>
                 ${paymentBadge(pay)}
+                ${ds}
               </div>
-              <div><strong>$${total}</strong></div>
+              <div><strong>₹${total}</strong></div>
             </div>
             <div class="muted">${buyer} ${email ? '• ' + email : ''}</div>
             <div class="items">${(h.items||[]).map(it => `
-              <div>${it.title} <span class="pill">${(it.item_type||'').toString().toUpperCase()}</span> <span class="pill">${it.action === 'rent' ? 'Rent' : 'Buy'}</span> x${it.quantity} — $${(Number(it.unit_price)*Number(it.quantity)).toFixed(2)}</div>
+              <div>${it.title} <span class="pill">${(it.item_type||'').toString().toUpperCase()}</span> <span class="pill">${it.action === 'rent' ? 'Rent' : 'Buy'}</span> x${it.quantity} — ₹${(Number(it.unit_price)*Number(it.quantity)).toFixed(2)}</div>
             `).join('')}</div>
           `;
           list.appendChild(div);
@@ -88,6 +93,13 @@
       else if (key === 'upi') { icon = '📱'; cls = 'pm-upi'; label = 'UPI'; }
       else if (key === 'cod' || key === 'cash on delivery') { icon = '💵'; cls = 'pm-cod'; label = 'COD'; }
       return `<span class="pill ${cls}">${icon} ${label}</span>`;
+    }
+    function deliveryBadge(status){
+      const s = (status||'Processing').trim().toLowerCase();
+      let label = 'Processing', cls = 'ds-processing';
+      if (s === 'out for delivery') { label = 'Out for delivery'; cls = 'ds-out'; }
+      else if (s === 'delivered' || s === 'successful' || s === 'success') { label = 'Delivered'; cls = 'ds-delivered'; }
+      return `<span class="pill ${cls}">📦 ${label}</span>`;
     }
     loadHistory();
   </script>

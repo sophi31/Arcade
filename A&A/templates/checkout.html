@@ -64,7 +64,7 @@
         </div>
         <div class="help">This is a demo checkout. No real payment will be processed.</div>
         <div style="margin-top:1rem">
-          <button class="btn" type="submit">Pay ${{ '%.2f'|format(subtotal) }}</button>
+          <button class="btn" type="submit">Pay ₹{{ '%.2f'|format(subtotal) }}</button>
         </div>
       </form>
     </section>
@@ -79,13 +79,13 @@
                 <div><strong>{{ it.title }}</strong></div>
                 <div class="muted">{{ it.item_type|capitalize }} • {{ 'Buy' if it.action=='buy' else 'Rent' }} x{{ it.quantity }}</div>
               </div>
-              <div class="right">${{ '%.2f'|format(it.unit_price * it.quantity) }}</div>
+              <div class="right">₹{{ '%.2f'|format(it.unit_price * it.quantity) }}</div>
             </div>
           {% endfor %}
         </div>
         <div class="total">
           <div>Total</div>
-          <div>${{ '%.2f'|format(subtotal) }}</div>
+          <div>₹{{ '%.2f'|format(subtotal) }}</div>
         </div>
       {% else %}
         <p>Your cart is empty.</p>

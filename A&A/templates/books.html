@@ -522,8 +522,8 @@
                 </div>
                 
                 <div class="book-prices">
-                    <span class="price buy-price">Buy: ${{ "%.2f"|format(book.buy_price) }}</span>
-                    <span class="price rent-price">Rent: ${{ "%.2f"|format(book.rent_price) }}</span>
+                    <span class="price buy-price">Buy: {{ book.buy_price|inr }}</span>
+                    <span class="price rent-price">Rent: {{ book.rent_price|inr }}</span>
                 </div>
                 
                 <div class="book-actions" style="margin-top:.5rem;">
