@@ -37,13 +37,29 @@ def create_app(config=None):
     # a writable persistent mount (e.g. /mnt/instance) so SQLite files survive
     # across deploys.
     inst_override = os.environ.get('INSTANCE_PATH')
+    
+    # Vercel Serverless Functions have a Read-Only filesystem except for /tmp
+    if os.environ.get('VERCEL') == '1':
+        inst_override = '/tmp'
+        
     if inst_override:
         # normalize and ensure directory exists
         inst_override = os.path.abspath(inst_override)
         os.makedirs(inst_override, exist_ok=True)
         app.instance_path = inst_override
+    else:
+        try:
+            os.makedirs(app.instance_path, exist_ok=True)
+        except OSError:
+            pass
+
     app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+    
+    # Safely construct absolute URI for SQLAlchemy
+    db_path = os.path.join(app.instance_path, 'users.db').replace('\\', '/')
+    # If absolute path starts with / (like /tmp), we need an extra slash
+    uri_prefix = 'sqlite:////' if db_path.startswith('/') else 'sqlite:///'
+    app.config['SQLALCHEMY_DATABASE_URI'] = uri_prefix + db_path.lstrip('/')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
     db.init_app(app)
@@ -1564,13 +1580,18 @@ def create_app(config=None):
             if not chat or me not in (chat['user1_id'], chat['user2_id']):
                 conn.close()
                 return jsonify({'error': 'forbidden'}), 403
-            # Save file
+            # Save file (with Vercel read-only filesystem fallback)
             upload_dir = os.path.join(app.static_folder, 'uploads', 'constellation')
-            os.makedirs(upload_dir, exist_ok=True)
             now = _dt.utcnow()
             unique_name = f"c{chat_id}_u{me}_{int(now.timestamp())}_{fname}"
             abs_path = os.path.join(upload_dir, unique_name)
-            file.save(abs_path)
+            
+            try:
+                os.makedirs(upload_dir, exist_ok=True)
+                file.save(abs_path)
+            except OSError:
+                pass # Ignore Read-Only File System errors on Vercel
+
             # Always use forward slashes so url_for('static') works on Windows too
             rel_path = 'uploads/constellation/' + unique_name
             now_str = now.isoformat()
