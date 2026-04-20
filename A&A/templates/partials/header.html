@@ -32,6 +32,7 @@
   <li style="opacity:.85;">Hi, {{ user_display_name or session.get('user') }}</li>
       {% endif %}
       {% if session.get('user') %}
+      <li><a href="{{ url_for('constellation_page') }}" style="background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(79,70,229,.25));border:1px solid rgba(167,139,250,.3);border-radius:8px;">🌌 Constellation</a></li>
       <li><a href="{{ url_for('history_page') }}">History</a></li>
       {% endif %}
       {% if is_admin %}

@@ -1254,6 +1254,414 @@ def create_app(config=None):
         resp.headers['Content-Disposition'] = 'attachment; filename=revenue.csv'
         return resp
 
+    # =====================================================================
+    # KNOWLEDGE CONSTELLATION
+    # =====================================================================
+
+    # --- Topic keyword map (label -> list of trigger words) ---
+    _TOPIC_KEYWORDS = {
+        "GATE 2026":        ["gate 2026", "gate2026", "gate exam", "gate"],
+        "Algorithms":       ["algorithm", "algorithms", "dsa", "sorting", "binary search",
+                             "graph traversal", "bfs", "dfs", "dynamic programming", "dp",
+                             "greedy", "recursion", "backtracking", "heap", "tree"],
+        "Operating Systems":["operating system", "os", "process", "semaphore", "scheduling",
+                             "deadlock", "paging", "segmentation", "memory management",
+                             "thread", "mutex", "ipc"],
+        "Computer Networks":["network", "tcp", "ip", "http", "dns", "routing", "subnet",
+                             "osi", "socket", "bandwidth", "protocol"],
+        "Databases":        ["sql", "database", "dbms", "query", "normalization",
+                             "transaction", "acid", "index", "join", "er diagram"],
+        "Mathematics":      ["math", "calculus", "linear algebra", "probability",
+                             "statistics", "discrete math", "combinatorics", "matrix"],
+        "Study Material":   ["notes", "note", "pdf", "question paper", "pyq",
+                             "previous year", "study material", "cheat sheet", "formula"],
+        "Data Structures":  ["data structure", "linked list", "stack", "queue", "array",
+                             "hash table", "hashmap", "trie", "segment tree"],
+        "Theory of Computation": ["toc", "automata", "turing machine", "context free",
+                                  "regular expression", "grammar", "pushdown"],
+        "Computer Architecture": ["architecture", "cpu", "cache", "pipeline", "risc",
+                                  "cisc", "instruction set", "register"],
+    }
+
+    def _constellation_db_path():
+        os.makedirs(app.instance_path, exist_ok=True)
+        return os.path.join(app.instance_path, 'constellation.db')
+
+    def _ensure_constellation_tables(conn):
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user1_id INTEGER NOT NULL,
+                user2_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user1_id, user2_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                content TEXT,
+                file_path TEXT,
+                file_name TEXT,
+                file_type TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS constellation_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                node_type TEXT NOT NULL DEFAULT 'topic',
+                source_message_id INTEGER,
+                mention_count INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, label)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS constellation_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                weight INTEGER DEFAULT 1,
+                UNIQUE(chat_id, source_node_id, target_node_id)
+            )
+        """)
+        conn.commit()
+
+    def _extract_topics(text):
+        """Return list of matching topic labels from message text."""
+        if not text:
+            return []
+        tl = text.lower()
+        found = []
+        for label, keywords in _TOPIC_KEYWORDS.items():
+            for kw in keywords:
+                if kw in tl:
+                    found.append(label)
+                    break
+        return found
+
+    def _upsert_node(cur, chat_id, label, node_type, msg_id, now):
+        """Insert or increment mention_count for a node; returns its id."""
+        cur.execute(
+            "SELECT id, mention_count FROM constellation_nodes WHERE chat_id=? AND label=?",
+            (chat_id, label)
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                "UPDATE constellation_nodes SET mention_count=mention_count+1 WHERE id=?",
+                (row[0],)
+            )
+            return row[0]
+        else:
+            cur.execute(
+                """INSERT INTO constellation_nodes(chat_id, label, node_type, source_message_id, mention_count, created_at)
+                   VALUES(?,?,?,?,1,?)""",
+                (chat_id, label, node_type, msg_id, now)
+            )
+            return cur.lastrowid
+
+    def _upsert_edge(cur, chat_id, src_id, tgt_id):
+        if src_id == tgt_id:
+            return
+        a, b = (src_id, tgt_id) if src_id < tgt_id else (tgt_id, src_id)
+        cur.execute(
+            "SELECT id FROM constellation_edges WHERE chat_id=? AND source_node_id=? AND target_node_id=?",
+            (chat_id, a, b)
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                "UPDATE constellation_edges SET weight=weight+1 WHERE id=?", (row[0],)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO constellation_edges(chat_id, source_node_id, target_node_id, weight) VALUES(?,?,?,1)",
+                (chat_id, a, b)
+            )
+
+    def _get_or_create_chat(conn, uid1, uid2):
+        cur = conn.cursor()
+        a, b = (uid1, uid2) if uid1 < uid2 else (uid2, uid1)
+        cur.execute(
+            "SELECT id FROM chats WHERE user1_id=? AND user2_id=?", (a, b)
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+        from datetime import datetime as _dt
+        cur.execute(
+            "INSERT INTO chats(user1_id, user2_id, created_at) VALUES(?,?,?)",
+            (a, b, _dt.utcnow().isoformat())
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    # --- Page routes ---
+    @app.route('/constellation')
+    def constellation_page():
+        if 'user' not in session and 'user_id' not in session:
+            return redirect(url_for('login'))
+        return render_template('constellation.html')
+
+    @app.route('/constellation/<int:other_uid>')
+    def constellation_chat(other_uid):
+        if 'user' not in session and 'user_id' not in session:
+            return redirect(url_for('login'))
+        return render_template('constellation.html', open_uid=other_uid)
+
+    # --- API: list all users to DM ---
+    @app.route('/api/constellation/users')
+    def constellation_users():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            users = User.query.filter(User.id != me).order_by(User.username).all()
+            return jsonify([{
+                'id': u.id,
+                'username': u.username,
+                'display_name': getattr(u, 'display_name', None) or u.username,
+                'photo_path': getattr(u, 'photo_path', None)
+            } for u in users])
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- API: get or create chat id ---
+    @app.route('/api/constellation/chat/<int:other_uid>')
+    def constellation_get_chat(other_uid):
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            chat_id = _get_or_create_chat(conn, me, other_uid)
+            conn.close()
+            return jsonify({'chat_id': chat_id})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- API: load messages for a chat ---
+    @app.route('/api/constellation/messages/<int:chat_id>')
+    def constellation_messages(chat_id):
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            # Verify membership
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            since = request.args.get('since_id', 0, type=int)
+            cur.execute(
+                "SELECT * FROM messages WHERE chat_id=? AND id>? ORDER BY id ASC",
+                (chat_id, since)
+            )
+            rows = []
+            for r in cur.fetchall():
+                d = dict(r)
+                if d.get('file_path'):
+                    d['file_url'] = url_for('static', filename=d['file_path'])
+                rows.append(d)
+            conn.close()
+            return jsonify(rows)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- API: send message ---
+    @app.route('/api/constellation/send', methods=['POST'])
+    def constellation_send():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        data = request.get_json(silent=True) or {}
+        chat_id = int(data.get('chat_id') or 0)
+        content = (data.get('content') or '').strip()
+        if not chat_id or not content:
+            return jsonify({'error': 'chat_id and content required'}), 400
+        from datetime import datetime as _dt
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            # Verify membership
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            now = _dt.utcnow().isoformat()
+            cur.execute(
+                "INSERT INTO messages(chat_id, sender_id, content, created_at) VALUES(?,?,?,?)",
+                (chat_id, me, content, now)
+            )
+            msg_id = cur.lastrowid
+            conn.commit()
+            # Topic extraction + graph update
+            topics = _extract_topics(content)
+            node_ids = []
+            for topic in topics:
+                nid = _upsert_node(cur, chat_id, topic, 'topic', msg_id, now)
+                node_ids.append(nid)
+            
+            # Connect all co-occurring topics in the same message
+            for i in range(len(node_ids)):
+                for j in range(i + 1, len(node_ids)):
+                    _upsert_edge(cur, chat_id, node_ids[i], node_ids[j])
+            
+            # Fallback: if message only had one topic and no existing connections, it will naturally form its own separated cluster.
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'id': msg_id, 'topics_found': topics})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- API: upload file ---
+    @app.route('/api/constellation/upload', methods=['POST'])
+    def constellation_upload():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        chat_id_raw = (request.form.get('chat_id') or '').strip()
+        file = request.files.get('file')
+        if not chat_id_raw or not file or not getattr(file, 'filename', ''):
+            return jsonify({'error': 'chat_id and file required'}), 400
+        chat_id = int(chat_id_raw)
+        fname = secure_filename(file.filename)
+        ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+        allowed = {'pdf', 'png', 'jpg', 'jpeg', 'txt', 'doc', 'docx', 'xls', 'xlsx', 'webp'}
+        if ext not in allowed:
+            return jsonify({'error': f'File type .{ext} not allowed'}), 400
+        file_type = 'pdf' if ext == 'pdf' else ('image' if ext in ('png','jpg','jpeg','webp') else 'note')
+        from datetime import datetime as _dt
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            # Save file
+            upload_dir = os.path.join(app.static_folder, 'uploads', 'constellation')
+            os.makedirs(upload_dir, exist_ok=True)
+            now = _dt.utcnow()
+            unique_name = f"c{chat_id}_u{me}_{int(now.timestamp())}_{fname}"
+            abs_path = os.path.join(upload_dir, unique_name)
+            file.save(abs_path)
+            # Always use forward slashes so url_for('static') works on Windows too
+            rel_path = 'uploads/constellation/' + unique_name
+            now_str = now.isoformat()
+            cur.execute(
+                """INSERT INTO messages(chat_id, sender_id, content, file_path, file_name, file_type, created_at)
+                   VALUES(?,?,NULL,?,?,?,?)""",
+                (chat_id, me, rel_path, file.filename, file_type, now_str)
+            )
+            msg_id = cur.lastrowid
+            conn.commit()
+            # Create a file node in the graph
+            node_label = file.filename
+            nid_file = _upsert_node(cur, chat_id, node_label, 'file', msg_id, now_str)
+
+            linked_topics = set()
+
+            # 1) Normalize filename (replace _ and - with space) so multi-word topics match
+            normalized_name = file.filename.lower().replace('_', ' ').replace('-', ' ')
+            for topic in _extract_topics(normalized_name):
+                nid_topic = _upsert_node(cur, chat_id, topic, 'topic', msg_id, now_str)
+                _upsert_edge(cur, chat_id, nid_file, nid_topic)
+                linked_topics.add(topic)
+
+            # 2) Fallback: if file still has zero connections, create a "Shared Files" hub
+            if not linked_topics:
+                nid_hub = _upsert_node(cur, chat_id, 'Shared Files', 'topic', msg_id, now_str)
+                _upsert_edge(cur, chat_id, nid_file, nid_hub)
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'id': msg_id, 'file_url': url_for('static', filename=rel_path)})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- API: get graph data for constellation ---
+    @app.route('/api/constellation/graph/<int:chat_id>')
+    def constellation_graph(chat_id):
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            cur.execute(
+                "SELECT id, label, node_type, mention_count FROM constellation_nodes WHERE chat_id=? ORDER BY mention_count DESC",
+                (chat_id,)
+            )
+            nodes = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT source_node_id, target_node_id, weight FROM constellation_edges WHERE chat_id=?",
+                (chat_id,)
+            )
+            edges = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            return jsonify({'nodes': nodes, 'edges': edges})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- API: delete a node from the graph ---
+    @app.route('/api/constellation/node/<int:chat_id>/<int:node_id>', methods=['DELETE'])
+    def constellation_delete_node(chat_id, node_id):
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            
+            cur.execute("DELETE FROM constellation_edges WHERE chat_id=? AND (source_node_id=? OR target_node_id=?)", (chat_id, node_id, node_id))
+            cur.execute("DELETE FROM constellation_nodes WHERE chat_id=? AND id=?", (chat_id, node_id))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
     return app
 
 
