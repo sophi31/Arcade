@@ -11,7 +11,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from models import db, User
 
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 try:
     from dotenv import load_dotenv
@@ -66,11 +66,20 @@ def create_app(config=None):
 
     app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
     
-    # Safely construct absolute URI for SQLAlchemy
-    db_path = os.path.join(app.instance_path, 'users.db').replace('\\', '/')
-    # If absolute path starts with / (like /tmp), we need an extra slash
-    uri_prefix = 'sqlite:////' if db_path.startswith('/') else 'sqlite:///'
-    app.config['SQLALCHEMY_DATABASE_URI'] = uri_prefix + db_path.lstrip('/')
+    database_url = (os.getenv('DATABASE_URL') or '').strip()
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql+psycopg://', 1)
+    elif database_url.startswith('postgresql://') and '+psycopg' not in database_url.split('://', 1)[0]:
+        database_url = database_url.replace('postgresql://', 'postgresql+psycopg://', 1)
+
+    if database_url:
+        app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+    else:
+        # Safely construct absolute URI for SQLAlchemy
+        db_path = os.path.join(app.instance_path, 'users.db').replace('\\', '/')
+        # If absolute path starts with / (like /tmp), we need an extra slash
+        uri_prefix = 'sqlite:////' if db_path.startswith('/') else 'sqlite:///'
+        app.config['SQLALCHEMY_DATABASE_URI'] = uri_prefix + db_path.lstrip('/')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
     db.init_app(app)
@@ -1715,6 +1724,28 @@ def create_app(config=None):
             'photo_path': getattr(user, 'photo_path', None)
         }
 
+    def _find_user_by_handle(handle):
+        handle = (handle or '').strip()
+        if handle.startswith('@'):
+            handle = handle[1:].strip()
+        if '#' not in handle:
+            return None
+        username, tag = handle.rsplit('#', 1)
+        username = username.strip().lstrip('@')
+        tag = tag.strip()
+        if not username or len(tag) != 4 or not tag.isdigit():
+            return None
+        try:
+            for user in User.query.filter((User.user_tag == None) | (User.user_tag == '')).all():
+                user.user_tag = _generate_user_tag()
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+        return User.query.filter(
+            func.lower(User.username) == username.lower(),
+            User.user_tag == tag
+        ).first()
+
     # --- Page routes ---
     @app.route('/constellation')
     def constellation_page():
@@ -1806,11 +1837,11 @@ def create_app(config=None):
         handle = (data.get('handle') or '').strip()
         if '#' not in handle:
             return jsonify({'error': 'Enter the full username#0000'}), 400
-        username, tag = handle.rsplit('#', 1)
-        username, tag = username.strip(), tag.strip()
-        if not username or len(tag) != 4 or not tag.isdigit():
-            return jsonify({'error': 'Enter the full username#0000'}), 400
-        target = User.query.filter_by(username=username, user_tag=tag).first()
+        if os.environ.get('VERCEL') == '1' and not os.getenv('DATABASE_URL'):
+            return jsonify({
+                'error': 'Friend lookup needs a shared DATABASE_URL on Vercel. Local SQLite in /tmp is not shared between users.'
+            }), 503
+        target = _find_user_by_handle(handle)
         if not target:
             return jsonify({'error': 'No user found with that tag'}), 404
         if target.id == me:
