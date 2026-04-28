@@ -19,6 +19,15 @@ try:
 except ImportError:
     pass
 
+try:
+    from pymongo import MongoClient, ASCENDING, DESCENDING
+    from pymongo.errors import PyMongoError
+except ImportError:
+    MongoClient = None
+    ASCENDING = 1
+    DESCENDING = -1
+    PyMongoError = Exception
+
 # import blueprints safely (package vs script execution)
 try:
     from .games_api import games_bp
@@ -117,6 +126,149 @@ def create_app(config=None):
             user.user_tag = _generate_user_tag()
             db.session.commit()
         return getattr(user, 'user_tag', None) if user else None
+
+    def _mongo_enabled():
+        return bool((os.getenv('MONGODB_URI') or '').strip()) and MongoClient is not None and not getattr(app, 'mongo_failed', False)
+
+    def _mongo_available():
+        return _mongo_db() is not None
+
+    def _mongo_db():
+        if not _mongo_enabled():
+            return None
+        if not hasattr(app, 'mongo_client'):
+            try:
+                app.mongo_client = MongoClient((os.getenv('MONGODB_URI') or '').strip(), serverSelectionTimeoutMS=5000)
+                app.mongo_client.admin.command('ping')
+                app.mongo_db = app.mongo_client[(os.getenv('MONGODB_DB') or 'arcade').strip() or 'arcade']
+                _ensure_mongo_indexes(app.mongo_db)
+            except Exception as exc:
+                app.mongo_failed = True
+                app.logger.warning("MongoDB connection unavailable; falling back to local storage: %s", exc)
+                return None
+        return app.mongo_db
+
+    def _ensure_mongo_indexes(mdb):
+        mdb.users.create_index([('handle_lc', ASCENDING)], unique=True)
+        mdb.users.create_index([('username_lc', ASCENDING)], unique=True)
+        mdb.friend_requests.create_index([('pair_key', ASCENDING)], unique=True)
+        mdb.friend_requests.create_index([('receiver_key', ASCENDING), ('status', ASCENDING)])
+        mdb.chats.create_index([('chat_id', ASCENDING)], unique=True)
+        mdb.chats.create_index([('participants', ASCENDING)])
+        mdb.messages.create_index([('chat_id', ASCENDING), ('created_at', ASCENDING)])
+        mdb.idea_messages.create_index([('chat_id', ASCENDING), ('created_at', ASCENDING)])
+        mdb.graph_nodes.create_index([('chat_id', ASCENDING), ('label_lc', ASCENDING), ('mode', ASCENDING)], unique=True)
+        mdb.graph_edges.create_index([('chat_id', ASCENDING), ('source_label_lc', ASCENDING), ('target_label_lc', ASCENDING), ('mode', ASCENDING)], unique=True)
+
+    def _mongo_key(username):
+        return (username or '').strip().lower()
+
+    def _mongo_pair_key(a, b):
+        return '|'.join(sorted([_mongo_key(a), _mongo_key(b)]))
+
+    def _mongo_chat_id(a, b):
+        return _mongo_pair_key(a, b)
+
+    def _mongo_current_user():
+        if not _mongo_enabled():
+            return None
+        username = (session.get('user') or session.get('username') or '').strip()
+        if not username:
+            return None
+        user = db.session.get(User, int(session.get('user_id') or 0)) if session.get('user_id') else None
+        tag = session.get('user_tag') or (getattr(user, 'user_tag', None) if user else None)
+        if user and not tag:
+            tag = _ensure_user_tag(user)
+        if not tag:
+            tag = f"{random.randint(0, 9999):04d}"
+            session['user_tag'] = tag
+        handle = f"{username}#{tag}"
+        doc = {
+            '_id': _mongo_key(username),
+            'username': username,
+            'username_lc': _mongo_key(username),
+            'user_tag': tag,
+            'handle': handle,
+            'handle_lc': handle.lower(),
+            'display_name': getattr(user, 'display_name', None) or username,
+            'photo_path': getattr(user, 'photo_path', None),
+        }
+        mdb = _mongo_db()
+        if mdb is None:
+            return None
+        mdb.users.update_one({'_id': doc['_id']}, {'$set': doc}, upsert=True)
+        return doc
+
+    def _mongo_public_user(doc):
+        if not doc:
+            return None
+        return {
+            'id': doc['_id'],
+            'username': doc.get('username'),
+            'user_tag': doc.get('user_tag'),
+            'handle': doc.get('handle'),
+            'display_name': doc.get('display_name') or doc.get('username'),
+            'photo_path': doc.get('photo_path')
+        }
+
+    def _mongo_find_user_by_handle(handle):
+        handle = (handle or '').strip()
+        if handle.startswith('@'):
+            handle = handle[1:].strip()
+        mdb = _mongo_db()
+        if mdb is None:
+            return None
+        return mdb.users.find_one({'handle_lc': handle.lower()})
+
+    def _mongo_are_friends(a, b):
+        mdb = _mongo_db()
+        if mdb is None:
+            return False
+        req = mdb.friend_requests.find_one({'pair_key': _mongo_pair_key(a, b), 'status': 'accepted'})
+        return bool(req)
+
+    def _mongo_upsert_graph(mode, chat_id, labels, edges):
+        mdb = _mongo_db()
+        for label in _dedupe_labels(labels, max_items=10):
+            mdb.graph_nodes.update_one(
+                {'chat_id': chat_id, 'mode': mode, 'label_lc': label.lower()},
+                {'$setOnInsert': {'chat_id': chat_id, 'mode': mode, 'label': label, 'node_type': 'idea' if mode == 'ideas' else 'topic'},
+                 '$inc': {'mention_count': 1}},
+                upsert=True
+            )
+        for src, tgt in edges:
+            src, tgt = _clean_graph_label(src), _clean_graph_label(tgt)
+            if not src or not tgt or src.lower() == tgt.lower():
+                continue
+            a, b = sorted([src, tgt], key=str.lower)
+            mdb.graph_edges.update_one(
+                {'chat_id': chat_id, 'mode': mode, 'source_label_lc': a.lower(), 'target_label_lc': b.lower()},
+                {'$setOnInsert': {'chat_id': chat_id, 'mode': mode, 'source_label': a, 'target_label': b},
+                 '$inc': {'weight': 1}},
+                upsert=True
+            )
+
+    def _mongo_graph(mode, chat_id):
+        mdb = _mongo_db()
+        nodes = list(mdb.graph_nodes.find({'chat_id': chat_id, 'mode': mode}).sort('mention_count', DESCENDING))
+        label_to_id = {}
+        out_nodes = []
+        for i, n in enumerate(nodes, start=1):
+            node_id = n.get('label_lc')
+            label_to_id[node_id] = node_id
+            out_nodes.append({
+                'id': node_id,
+                'label': n.get('label'),
+                'node_type': n.get('node_type', 'idea' if mode == 'ideas' else 'topic'),
+                'mention_count': n.get('mention_count', 1)
+            })
+        out_edges = []
+        for e in mdb.graph_edges.find({'chat_id': chat_id, 'mode': mode}):
+            src = e.get('source_label_lc')
+            tgt = e.get('target_label_lc')
+            if src in label_to_id and tgt in label_to_id:
+                out_edges.append({'source_node_id': src, 'target_node_id': tgt, 'weight': e.get('weight', 1)})
+        return {'nodes': out_nodes, 'edges': out_edges}
 
     @app.before_request
     def create_tables():
@@ -236,6 +388,9 @@ def create_app(config=None):
                 _ensure_user_tag(user)
                 session['user'] = user.username
                 session['user_id'] = user.id  # Add user_id to match auth.py
+                session['user_tag'] = user.user_tag
+                if _mongo_available():
+                    _mongo_current_user()
                 # If a community email is present from a prior join, link it to this account
                 try:
                     cem = (session.get('community_email') or '').strip().lower()
@@ -277,6 +432,9 @@ def create_app(config=None):
                 session.pop('user_id', None)
                 session['user'] = username
                 session['user_id'] = new_user.id
+                session['user_tag'] = new_user.user_tag
+                if _mongo_available():
+                    _mongo_current_user()
                 # Link existing community email (if any in session) to new account
                 try:
                     cem = (session.get('community_email') or '').strip().lower()
@@ -298,6 +456,7 @@ def create_app(config=None):
         session.pop('user', None)
         session.pop('username', None)
         session.pop('user_id', None)
+        session.pop('user_tag', None)
         session.pop('cart', None)
         session.pop('community_email', None)
         return redirect(url_for('index'))
@@ -1764,6 +1923,11 @@ def create_app(config=None):
     def constellation_me():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            return jsonify(_mongo_public_user(current))
         user = db.session.get(User, int(session.get('user_id') or 0))
         if not user:
             return jsonify({'error': 'auth required'}), 401
@@ -1774,6 +1938,18 @@ def create_app(config=None):
     def constellation_users():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            mdb = _mongo_db()
+            rows = mdb.friend_requests.find({
+                'status': 'accepted',
+                '$or': [{'requester_key': current['_id']}, {'receiver_key': current['_id']}]
+            }).sort('responded_at', DESCENDING)
+            friend_keys = [r['receiver_key'] if r['requester_key'] == current['_id'] else r['requester_key'] for r in rows]
+            users = list(mdb.users.find({'_id': {'$in': friend_keys}}).sort('username_lc', ASCENDING))
+            return jsonify([_mongo_public_user(u) for u in users])
         me = int(session.get('user_id') or 0)
         try:
             dbp = _constellation_db_path()
@@ -1800,6 +1976,27 @@ def create_app(config=None):
     def constellation_friend_requests():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            mdb = _mongo_db()
+            rows = mdb.friend_requests.find({
+                'status': 'pending',
+                '$or': [{'requester_key': current['_id']}, {'receiver_key': current['_id']}]
+            }).sort('created_at', DESCENDING)
+            requests = []
+            for row in rows:
+                other_key = row['requester_key'] if row['receiver_key'] == current['_id'] else row['receiver_key']
+                other = mdb.users.find_one({'_id': other_key})
+                if not other:
+                    continue
+                requests.append({
+                    'id': str(row['_id']),
+                    'direction': 'incoming' if row['receiver_key'] == current['_id'] else 'outgoing',
+                    'user': _mongo_public_user(other)
+                })
+            return jsonify(requests)
         me = int(session.get('user_id') or 0)
         try:
             dbp = _constellation_db_path()
@@ -1832,6 +2029,40 @@ def create_app(config=None):
     def constellation_send_friend_request():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            data = request.get_json(silent=True) or {}
+            handle = (data.get('handle') or '').strip()
+            if '#' not in handle:
+                return jsonify({'error': 'Enter the full username#0000'}), 400
+            target = _mongo_find_user_by_handle(handle)
+            if not target:
+                return jsonify({'error': 'No user found with that tag'}), 404
+            if target['_id'] == current['_id']:
+                return jsonify({'error': 'You cannot add yourself'}), 400
+            from datetime import datetime as _dt
+            mdb = _mongo_db()
+            pair_key = _mongo_pair_key(current['_id'], target['_id'])
+            existing = mdb.friend_requests.find_one({'pair_key': pair_key})
+            if existing and existing.get('status') == 'accepted':
+                return jsonify({'success': True, 'status': 'accepted', 'message': 'Already friends'})
+            if existing and existing.get('status') == 'pending':
+                return jsonify({'success': True, 'status': 'pending', 'message': 'Friend request already pending'})
+            mdb.friend_requests.update_one(
+                {'pair_key': pair_key},
+                {'$set': {
+                    'pair_key': pair_key,
+                    'requester_key': current['_id'],
+                    'receiver_key': target['_id'],
+                    'status': 'pending',
+                    'created_at': _dt.utcnow().isoformat(),
+                    'responded_at': None
+                }},
+                upsert=True
+            )
+            return jsonify({'success': True, 'status': 'pending'})
         me = int(session.get('user_id') or 0)
         data = request.get_json(silent=True) or {}
         handle = (data.get('handle') or '').strip()
@@ -1875,6 +2106,36 @@ def create_app(config=None):
     def constellation_respond_friend_request():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            data = request.get_json(silent=True) or {}
+            req_id = (data.get('request_id') or '').strip()
+            action = (data.get('action') or '').strip().lower()
+            if action not in ('accept', 'decline'):
+                return jsonify({'error': 'action must be accept or decline'}), 400
+            from bson import ObjectId
+            from bson.errors import InvalidId
+            from datetime import datetime as _dt
+            mdb = _mongo_db()
+            try:
+                request_oid = ObjectId(req_id)
+            except (InvalidId, TypeError):
+                return jsonify({'error': 'request not found'}), 404
+            row = mdb.friend_requests.find_one({'_id': request_oid, 'receiver_key': current['_id'], 'status': 'pending'})
+            if not row:
+                return jsonify({'error': 'request not found'}), 404
+            status = 'accepted' if action == 'accept' else 'declined'
+            mdb.friend_requests.update_one({'_id': row['_id']}, {'$set': {'status': status, 'responded_at': _dt.utcnow().isoformat()}})
+            if status == 'accepted':
+                chat_id = _mongo_chat_id(row['requester_key'], row['receiver_key'])
+                mdb.chats.update_one(
+                    {'chat_id': chat_id},
+                    {'$setOnInsert': {'chat_id': chat_id, 'participants': sorted([row['requester_key'], row['receiver_key']]), 'created_at': _dt.utcnow().isoformat()}},
+                    upsert=True
+                )
+            return jsonify({'success': True, 'status': status})
         me = int(session.get('user_id') or 0)
         data = request.get_json(silent=True) or {}
         req_id = int(data.get('request_id') or 0)
@@ -1907,10 +2168,28 @@ def create_app(config=None):
             return jsonify({'error': str(e)}), 500
 
     # --- API: get or create chat id ---
-    @app.route('/api/constellation/chat/<int:other_uid>')
+    @app.route('/api/constellation/chat/<path:other_uid>')
     def constellation_get_chat(other_uid):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            other = _mongo_db().users.find_one({'_id': _mongo_key(other_uid)})
+            if not other:
+                return jsonify({'error': 'user not found'}), 404
+            if not _mongo_are_friends(current['_id'], other['_id']):
+                return jsonify({'error': 'friend request must be accepted before chatting'}), 403
+            from datetime import datetime as _dt
+            chat_id = _mongo_chat_id(current['_id'], other['_id'])
+            _mongo_db().chats.update_one(
+                {'chat_id': chat_id},
+                {'$setOnInsert': {'chat_id': chat_id, 'participants': sorted([current['_id'], other['_id']]), 'created_at': _dt.utcnow().isoformat()}},
+                upsert=True
+            )
+            return jsonify({'chat_id': chat_id})
+        other_uid = int(other_uid)
         me = int(session.get('user_id') or 0)
         if other_uid == me:
             return jsonify({'error': 'choose another user to start a chat'}), 400
@@ -1932,10 +2211,34 @@ def create_app(config=None):
             return jsonify({'error': str(e)}), 500
 
     # --- API: load messages for a chat ---
-    @app.route('/api/constellation/messages/<int:chat_id>')
+    @app.route('/api/constellation/messages/<path:chat_id>')
     def constellation_messages(chat_id):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            since = request.args.get('since_id', '')
+            query = {'chat_id': chat_id}
+            if since and since != '0':
+                from bson import ObjectId
+                from bson.errors import InvalidId
+                try:
+                    query['_id'] = {'$gt': ObjectId(since)}
+                except (InvalidId, TypeError):
+                    pass
+            rows = []
+            for r in _mongo_db().messages.find(query).sort('created_at', ASCENDING).limit(100):
+                rows.append({
+                    'id': str(r['_id']),
+                    'sender_id': r.get('sender_key'),
+                    'content': r.get('content'),
+                    'created_at': r.get('created_at')
+                })
+            return jsonify(rows)
+        chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
             dbp = _constellation_db_path()
@@ -1970,12 +2273,29 @@ def create_app(config=None):
     def constellation_send():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
-        me = int(session.get('user_id') or 0)
         data = request.get_json(silent=True) or {}
-        chat_id = int(data.get('chat_id') or 0)
+        chat_id_raw = data.get('chat_id') or ''
         content = (data.get('content') or '').strip()
-        if not chat_id or not content:
+        if not chat_id_raw or not content:
             return jsonify({'error': 'chat_id and content required'}), 400
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat_id = str(chat_id_raw)
+            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            from datetime import datetime as _dt
+            now = _dt.utcnow().isoformat()
+            inserted = _mongo_db().messages.insert_one({'chat_id': chat_id, 'sender_key': current['_id'], 'content': content, 'created_at': now})
+            topics = _extract_topics(content)
+            edges = []
+            for i in range(len(topics)):
+                for j in range(i + 1, len(topics)):
+                    edges.append((topics[i], topics[j]))
+            _mongo_upsert_graph('chat', chat_id, topics, edges)
+            return jsonify({'success': True, 'id': str(inserted.inserted_id), 'topics_found': topics})
+        me = int(session.get('user_id') or 0)
+        chat_id = int(chat_id_raw)
         from datetime import datetime as _dt
         try:
             dbp = _constellation_db_path()
@@ -2016,10 +2336,32 @@ def create_app(config=None):
             return jsonify({'error': str(e)}), 500
 
     # --- Ideas mode: messages ---
-    @app.route('/api/constellation/ideas/messages/<int:chat_id>')
+    @app.route('/api/constellation/ideas/messages/<path:chat_id>')
     def constellation_idea_messages(chat_id):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            since = request.args.get('since_id', '')
+            query = {'chat_id': chat_id}
+            if since and since != '0':
+                from bson import ObjectId
+                from bson.errors import InvalidId
+                try:
+                    query['_id'] = {'$gt': ObjectId(since)}
+                except (InvalidId, TypeError):
+                    pass
+            rows = [{
+                'id': str(r['_id']),
+                'sender_id': r.get('sender_key'),
+                'content': r.get('content'),
+                'created_at': r.get('created_at')
+            } for r in _mongo_db().idea_messages.find(query).sort('created_at', ASCENDING).limit(100)]
+            return jsonify(rows)
+        chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
             dbp = _constellation_db_path()
@@ -2047,12 +2389,33 @@ def create_app(config=None):
     def constellation_idea_send():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
-        me = int(session.get('user_id') or 0)
         data = request.get_json(silent=True) or {}
-        chat_id = int(data.get('chat_id') or 0)
+        chat_id_raw = data.get('chat_id') or ''
         content = (data.get('content') or '').strip()
-        if not chat_id or not content:
+        if not chat_id_raw or not content:
             return jsonify({'error': 'chat_id and content required'}), 400
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat_id = str(chat_id_raw)
+            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            from datetime import datetime as _dt
+            now = _dt.utcnow().isoformat()
+            inserted = _mongo_db().idea_messages.insert_one({'chat_id': chat_id, 'sender_key': current['_id'], 'content': content, 'created_at': now})
+            recent = list(_mongo_db().messages.find({'chat_id': chat_id}).sort('created_at', DESCENDING).limit(16))
+            recent += list(_mongo_db().idea_messages.find({'chat_id': chat_id}).sort('created_at', DESCENDING).limit(16))
+            context_messages = sorted([
+                {'sender_id': r.get('sender_key'), 'content': r.get('content'), 'created_at': r.get('created_at'), 'mode': 'ideas' if 'idea' in str(r.get('_id')) else 'chat'}
+                for r in recent
+            ], key=lambda r: r.get('created_at') or '')
+            ai_graph = _extract_idea_graph_with_ai(context_messages)
+            topics = ai_graph['nodes'] if ai_graph else _extract_topics(content)
+            edges = ai_graph['edges'] if ai_graph else [(topics[i], topics[j]) for i in range(len(topics)) for j in range(i + 1, len(topics))]
+            _mongo_upsert_graph('ideas', chat_id, topics, edges)
+            return jsonify({'success': True, 'id': str(inserted.inserted_id), 'topics_found': topics, 'ai_graph': bool(ai_graph)})
+        me = int(session.get('user_id') or 0)
+        chat_id = int(chat_id_raw)
         from datetime import datetime as _dt
         try:
             dbp = _constellation_db_path()
@@ -2117,10 +2480,17 @@ def create_app(config=None):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
-    @app.route('/api/constellation/ideas/graph/<int:chat_id>')
+    @app.route('/api/constellation/ideas/graph/<path:chat_id>')
     def constellation_idea_graph(chat_id):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            return jsonify(_mongo_graph('ideas', chat_id))
+        chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
             dbp = _constellation_db_path()
@@ -2158,6 +2528,8 @@ def create_app(config=None):
         file = request.files.get('file')
         if not chat_id_raw or not file or not getattr(file, 'filename', ''):
             return jsonify({'error': 'chat_id and file required'}), 400
+        if _mongo_available():
+            return jsonify({'error': 'File uploads are not available on Vercel Mongo chat yet'}), 400
         chat_id = int(chat_id_raw)
         fname = secure_filename(file.filename)
         ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
@@ -2223,10 +2595,17 @@ def create_app(config=None):
             return jsonify({'error': str(e)}), 500
 
     # --- API: get graph data for constellation ---
-    @app.route('/api/constellation/graph/<int:chat_id>')
+    @app.route('/api/constellation/graph/<path:chat_id>')
     def constellation_graph(chat_id):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            return jsonify(_mongo_graph('chat', chat_id))
+        chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
             dbp = _constellation_db_path()

@@ -307,6 +307,7 @@ const OPEN_UID = {{ open_uid if open_uid is defined else 'null' }};
 let activeChatId = null;
 let activeOtherUid = null;
 let knownFriends = [];
+let myKey = String(ME || '');
 let lastMsgId = { chat: 0, ideas: 0 };
 let pollTimer = null;
 let simulation = null;
@@ -343,6 +344,7 @@ async function loadMe(){
     const r = await fetch('/api/constellation/me');
     const me = await r.json();
     if(me.handle) document.getElementById('my-handle').textContent = me.handle;
+    if(me.id) myKey = String(me.id);
   } catch(e){
     document.getElementById('my-handle').textContent = 'unavailable';
   }
@@ -432,7 +434,7 @@ async function loadUsers(){
     users.forEach(u => {
       const el = document.createElement('div');
       el.className = 'user-item';
-      if(activeOtherUid === u.id) el.classList.add('active');
+      if(String(activeOtherUid) === String(u.id)) el.classList.add('active');
       el.dataset.uid = u.id;
       const initials = (u.display_name || u.username || '?').charAt(0).toUpperCase();
       const photoHTML = u.photo_path
@@ -443,7 +445,7 @@ async function loadUsers(){
       list.appendChild(el);
     });
     if(OPEN_UID){
-      const target = users.find(u => u.id === OPEN_UID);
+      const target = users.find(u => String(u.id) === String(OPEN_UID));
       if(target) openChat(target);
     }
   } catch(e){
@@ -453,7 +455,7 @@ async function loadUsers(){
 
 async function openChat(user){
   document.querySelectorAll('.user-item').forEach(el => {
-    el.classList.toggle('active', parseInt(el.dataset.uid) === user.id);
+    el.classList.toggle('active', String(el.dataset.uid) === String(user.id));
   });
   activeOtherUid = user.id;
   const initials = (user.display_name || user.username || '?').charAt(0).toUpperCase();
@@ -510,7 +512,7 @@ async function loadMessages(initial = false){
     if(!Array.isArray(msgs) || msgs.length === 0) return;
     const box = document.getElementById('messages');
     msgs.forEach(m => {
-      const sent = m.sender_id === ME;
+      const sent = String(m.sender_id) === String(ME) || String(m.sender_id) === myKey;
       const bubble = document.createElement('div');
       bubble.className = `msg-bubble ${sent ? 'sent' : 'recv'} ${activeMode === 'ideas' ? 'idea' : ''}`;
       bubble.dataset.msgId = m.id;
@@ -527,7 +529,11 @@ async function loadMessages(initial = false){
         bubble.innerHTML = `${escHtml(m.content || '')}<div class="msg-time">${fmtTime(m.created_at)}</div>`;
       }
       box.appendChild(bubble);
-      lastMsgId[activeMode] = Math.max(lastMsgId[activeMode] || 0, m.id);
+      if(typeof m.id === 'number'){
+        lastMsgId[activeMode] = Math.max(Number(lastMsgId[activeMode] || 0), m.id);
+      } else {
+        lastMsgId[activeMode] = m.id;
+      }
     });
     box.scrollTop = box.scrollHeight;
   } catch(e){}
