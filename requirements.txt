@@ -8,3 +8,4 @@ SQLAlchemy==2.0.44
 greenlet==3.2.4
 MarkupSafe==3.0.3
 typing_extensions==4.15.0
+python-dotenv>=1.0

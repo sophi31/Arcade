@@ -2,12 +2,23 @@ import os
 import sqlite3
 import io
 import csv
+import json
+import random
+import urllib.request
+import urllib.error
 from flask import Flask, render_template, request, session, redirect, url_for, flash, jsonify, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from models import db, User
 
 from sqlalchemy import text
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # import blueprints safely (package vs script execution)
 try:
     from .games_api import games_bp
@@ -85,6 +96,19 @@ def create_app(config=None):
             'usd_to_inr_rate': float(os.getenv('USD_TO_INR', '83'))
         }
 
+    def _generate_user_tag():
+        for _ in range(10000):
+            tag = f"{random.randint(0, 9999):04d}"
+            if not User.query.filter_by(user_tag=tag).first():
+                return tag
+        raise RuntimeError('No user tags available')
+
+    def _ensure_user_tag(user):
+        if user and not getattr(user, 'user_tag', None):
+            user.user_tag = _generate_user_tag()
+            db.session.commit()
+        return getattr(user, 'user_tag', None) if user else None
+
     @app.before_request
     def create_tables():
         if not hasattr(app, 'db_initialized'):
@@ -93,19 +117,31 @@ def create_app(config=None):
             # Self-heal User table to ensure profile columns exist
             try:
                 with db.engine.begin() as conn:
-                    cols = [row[1] for row in conn.exec_driver_sql('PRAGMA table_info(users)').fetchall()]
+                    user_table = User.__tablename__
+                    quoted_user_table = '"' + user_table.replace('"', '""') + '"'
+                    cols = [row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info({quoted_user_table})').fetchall()]
                     if 'display_name' not in cols:
-                        conn.exec_driver_sql('ALTER TABLE users ADD COLUMN display_name VARCHAR(120)')
+                        conn.exec_driver_sql(f'ALTER TABLE {quoted_user_table} ADD COLUMN display_name VARCHAR(120)')
                     if 'photo_path' not in cols:
-                        conn.exec_driver_sql('ALTER TABLE users ADD COLUMN photo_path VARCHAR(255)')
+                        conn.exec_driver_sql(f'ALTER TABLE {quoted_user_table} ADD COLUMN photo_path VARCHAR(255)')
+                    if 'user_tag' not in cols:
+                        conn.exec_driver_sql(f'ALTER TABLE {quoted_user_table} ADD COLUMN user_tag VARCHAR(4)')
+                    if 'email' not in cols:
+                        conn.exec_driver_sql(f'ALTER TABLE {quoted_user_table} ADD COLUMN email VARCHAR(255)')
             except Exception:
                 pass
+            try:
+                for user in User.query.filter((User.user_tag == None) | (User.user_tag == '')).all():
+                    user.user_tag = _generate_user_tag()
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
             # Ensure a default admin user exists for demo access
             try:
                 from sqlalchemy.exc import SQLAlchemyError
                 if not User.query.filter_by(username='admin').first():
                     admin_pw = os.getenv('ADMIN_DEFAULT_PASSWORD', 'admin123')
-                    admin_user = User(username='admin', password_hash=generate_password_hash(admin_pw))
+                    admin_user = User(username='admin', password_hash=generate_password_hash(admin_pw), user_tag=_generate_user_tag())
                     db.session.add(admin_user)
                     db.session.commit()
             except Exception:
@@ -180,15 +216,16 @@ def create_app(config=None):
     @app.route('/login', methods=['GET', 'POST'])
     def login():
         if request.method == 'POST':
-            username = request.form.get('ident')  # Changed from username to ident
+            username = (request.form.get('ident') or '').strip()
             password = request.form.get('password')
             if not username or not password:
                 flash("Please enter both username and password")
                 return redirect(url_for('login'))
 
-            user = User.query.filter_by(username=username).first()
+            user = User.query.filter((User.username == username) | (User.email == username.lower())).first()
             if user and check_password_hash(user.password_hash, password):
-                session['user'] = username
+                _ensure_user_tag(user)
+                session['user'] = user.username
                 session['user_id'] = user.id  # Add user_id to match auth.py
                 # If a community email is present from a prior join, link it to this account
                 try:
@@ -210,17 +247,20 @@ def create_app(config=None):
     @app.route('/signup', methods=['GET', 'POST'])
     def signup():
         if request.method == 'POST':
-            username = request.form.get('username')
+            username = (request.form.get('username') or '').strip()
+            email = (request.form.get('email') or '').strip().lower()
             password = request.form.get('password')
-            if not username or not password:
-                flash("Both fields are required")
+            if not username or not email or not password:
+                flash("Username, email and password are required")
                 return redirect(url_for('signup'))
 
             if User.query.filter_by(username=username).first():
                 flash('Username already exists')
+            elif User.query.filter_by(email=email).first():
+                flash('Email already exists')
             else:
                 hashed_pw = generate_password_hash(password)
-                new_user = User(username=username, password_hash=hashed_pw)
+                new_user = User(username=username, email=email, password_hash=hashed_pw, user_tag=_generate_user_tag())
                 db.session.add(new_user)
                 db.session.commit()
                 # Reset and set session identity to the new user
@@ -1315,6 +1355,17 @@ def create_app(config=None):
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS friend_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requester_id INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                responded_at TEXT,
+                UNIQUE(requester_id, receiver_id)
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -1348,7 +1399,64 @@ def create_app(config=None):
                 UNIQUE(chat_id, source_node_id, target_node_id)
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS idea_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS idea_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                source_message_id INTEGER,
+                mention_count INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id, label)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS idea_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                weight INTEGER DEFAULT 1,
+                UNIQUE(chat_id, source_node_id, target_node_id)
+            )
+        """)
         conn.commit()
+
+    _STOPWORDS = {
+        'the','and','for','that','with','this','from','your','you','are','but','not','was','were','have','has','had',
+        'our','out','into','about','there','their','then','than','them','they','will','would','what','when','where',
+        'which','while','who','how','why','can','could','should','a','an','in','on','of','to','by','as','is','it',
+        'be','or','at','if','we','i','me','my','mine','us','do','does','did','so','up','down','over','under'
+    }
+
+    def _extract_keywords(text, max_terms=6):
+        if not text:
+            return []
+        import re
+        text_l = text.lower()
+        tags = re.findall(r"#([a-z0-9][a-z0-9_-]{1,})", text_l)
+        words = re.findall(r"[a-z][a-z0-9+#-]{2,}", text_l)
+        counts = {}
+        for w in words:
+            if w in _STOPWORDS:
+                continue
+            w = w.strip('#')
+            if w in _STOPWORDS or len(w) < 3:
+                continue
+            counts[w] = counts.get(w, 0) + 1
+        for t in tags:
+            counts[t] = counts.get(t, 0) + 2
+        ordered = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+        return [k.title() for k, _ in ordered[:max_terms]]
 
     def _extract_topics(text):
         """Return list of matching topic labels from message text."""
@@ -1361,7 +1469,128 @@ def create_app(config=None):
                 if kw in tl:
                     found.append(label)
                     break
+        keywords = _extract_keywords(text)
+        for kw in keywords:
+            if kw not in found:
+                found.append(kw)
         return found
+
+    def _clean_graph_label(label):
+        label = (label or '').strip()
+        label = ' '.join(label.replace('\n', ' ').split())
+        if len(label) > 42:
+            label = label[:42].rstrip()
+        return label
+
+    def _dedupe_labels(labels, max_items=8):
+        seen = set()
+        clean = []
+        for label in labels or []:
+            label = _clean_graph_label(label)
+            key = label.lower()
+            if not label or key in seen:
+                continue
+            seen.add(key)
+            clean.append(label)
+            if len(clean) >= max_items:
+                break
+        return clean
+
+    def _openai_json_request(payload, timeout=12):
+        api_key = os.getenv('OPENAI_API_KEY', '').strip()
+        if not api_key:
+            return None
+        api_url = os.getenv('OPENAI_API_BASE_URL', '').strip()
+        if not api_url:
+            api_url = 'https://openrouter.ai/api/v1/chat/completions' if api_key.startswith('sk-or-') else 'https://api.openai.com/v1/chat/completions'
+        body = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        }
+        if 'openrouter.ai' in api_url:
+            headers['HTTP-Referer'] = os.getenv('APP_PUBLIC_URL', 'http://localhost:5000')
+            headers['X-Title'] = os.getenv('APP_NAME', 'Arcade')
+        req = urllib.request.Request(
+            api_url,
+            data=body,
+            headers=headers,
+            method='POST'
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+            return None
+
+    def _extract_idea_graph_with_ai(context_messages):
+        """Return AI-suggested graph labels and edges from recent chat context."""
+        if not os.getenv('OPENAI_API_KEY', '').strip():
+            return None
+        compact_messages = []
+        for m in context_messages[-24:]:
+            content = (m.get('content') or '').strip()
+            if content:
+                compact_messages.append({
+                    'mode': m.get('mode', 'chat'),
+                    'sender': str(m.get('sender_id', '')),
+                    'content': content[:700],
+                })
+        if not compact_messages:
+            return None
+
+        api_key = os.getenv('OPENAI_API_KEY', '').strip()
+        default_model = 'openai/gpt-4o-mini' if api_key.startswith('sk-or-') else 'gpt-4o-mini'
+        payload = {
+            'model': os.getenv('OPENAI_IDEA_MODEL', default_model),
+            'temperature': 0.2,
+            'response_format': {'type': 'json_object'},
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': (
+                        'You turn a two-person project conversation into a small meaningful graph. '
+                        'Return only JSON with "nodes" and "edges". Nodes must be short noun phrases. '
+                        'Edges must connect related node labels that both appear in nodes. Avoid generic labels.'
+                    )
+                },
+                {
+                    'role': 'user',
+                    'content': json.dumps({
+                        'max_nodes': 8,
+                        'max_edges': 10,
+                        'messages': compact_messages
+                    })
+                }
+            ]
+        }
+        result = _openai_json_request(payload)
+        try:
+            raw = result['choices'][0]['message']['content']
+            graph = json.loads(raw)
+        except (TypeError, KeyError, IndexError, json.JSONDecodeError):
+            return None
+
+        nodes = _dedupe_labels(graph.get('nodes'), max_items=8)
+        node_keys = {n.lower(): n for n in nodes}
+        edges = []
+        for edge in graph.get('edges') or []:
+            if isinstance(edge, dict):
+                src = edge.get('source') or edge.get('from')
+                tgt = edge.get('target') or edge.get('to')
+            elif isinstance(edge, (list, tuple)) and len(edge) >= 2:
+                src, tgt = edge[0], edge[1]
+            else:
+                continue
+            src = node_keys.get(_clean_graph_label(src).lower())
+            tgt = node_keys.get(_clean_graph_label(tgt).lower())
+            if src and tgt and src != tgt:
+                pair = tuple(sorted((src, tgt), key=str.lower))
+                if pair not in edges:
+                    edges.append(pair)
+            if len(edges) >= 10:
+                break
+        return {'nodes': nodes, 'edges': edges} if nodes else None
 
     def _upsert_node(cur, chat_id, label, node_type, msg_id, now):
         """Insert or increment mention_count for a node; returns its id."""
@@ -1403,6 +1632,45 @@ def create_app(config=None):
                 (chat_id, a, b)
             )
 
+    def _upsert_idea_node(cur, chat_id, label, msg_id, now):
+        cur.execute(
+            "SELECT id, mention_count FROM idea_nodes WHERE chat_id=? AND label=?",
+            (chat_id, label)
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                "UPDATE idea_nodes SET mention_count=mention_count+1 WHERE id=?",
+                (row[0],)
+            )
+            return row[0]
+        cur.execute(
+            """INSERT INTO idea_nodes(chat_id, label, source_message_id, mention_count, created_at)
+               VALUES(?,?,?,?,?)""",
+            (chat_id, label, msg_id, 1, now)
+        )
+        return cur.lastrowid
+
+    def _upsert_idea_edge(cur, chat_id, src_id, tgt_id):
+        if src_id == tgt_id:
+            return
+        a, b = (src_id, tgt_id) if src_id < tgt_id else (tgt_id, src_id)
+        cur.execute(
+            "SELECT id FROM idea_edges WHERE chat_id=? AND source_node_id=? AND target_node_id=?",
+            (chat_id, a, b)
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                "UPDATE idea_edges SET weight=weight+1 WHERE id=?",
+                (row[0],)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO idea_edges(chat_id, source_node_id, target_node_id, weight) VALUES(?,?,?,1)",
+                (chat_id, a, b)
+            )
+
     def _get_or_create_chat(conn, uid1, uid2):
         cur = conn.cursor()
         a, b = (uid1, uid2) if uid1 < uid2 else (uid2, uid1)
@@ -1420,6 +1688,33 @@ def create_app(config=None):
         conn.commit()
         return cur.lastrowid
 
+    def _friendship_status(cur, uid1, uid2):
+        if uid1 == uid2:
+            return 'self'
+        a, b = (uid1, uid2)
+        cur.execute(
+            """SELECT status, requester_id, receiver_id FROM friend_requests
+               WHERE (requester_id=? AND receiver_id=?) OR (requester_id=? AND receiver_id=?)
+               ORDER BY id DESC LIMIT 1""",
+            (a, b, b, a)
+        )
+        row = cur.fetchone()
+        return row['status'] if row else 'none'
+
+    def _are_friends(cur, uid1, uid2):
+        return _friendship_status(cur, uid1, uid2) == 'accepted'
+
+    def _public_user(user):
+        tag = _ensure_user_tag(user)
+        return {
+            'id': user.id,
+            'username': user.username,
+            'user_tag': tag,
+            'handle': f"{user.username}#{tag}",
+            'display_name': getattr(user, 'display_name', None) or user.username,
+            'photo_path': getattr(user, 'photo_path', None)
+        }
+
     # --- Page routes ---
     @app.route('/constellation')
     def constellation_page():
@@ -1433,20 +1728,150 @@ def create_app(config=None):
             return redirect(url_for('login'))
         return render_template('constellation.html', open_uid=other_uid)
 
-    # --- API: list all users to DM ---
+    # --- API: current user friendship identity ---
+    @app.route('/api/constellation/me')
+    def constellation_me():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        user = db.session.get(User, int(session.get('user_id') or 0))
+        if not user:
+            return jsonify({'error': 'auth required'}), 401
+        return jsonify(_public_user(user))
+
+    # --- API: list accepted friends to DM ---
     @app.route('/api/constellation/users')
     def constellation_users():
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
         me = int(session.get('user_id') or 0)
         try:
-            users = User.query.filter(User.id != me).order_by(User.username).all()
-            return jsonify([{
-                'id': u.id,
-                'username': u.username,
-                'display_name': getattr(u, 'display_name', None) or u.username,
-                'photo_path': getattr(u, 'photo_path', None)
-            } for u in users])
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT requester_id, receiver_id FROM friend_requests
+                   WHERE status='accepted' AND (requester_id=? OR receiver_id=?)
+                   ORDER BY responded_at DESC, created_at DESC""",
+                (me, me)
+            )
+            friend_ids = [r['receiver_id'] if r['requester_id'] == me else r['requester_id'] for r in cur.fetchall()]
+            conn.close()
+            if not friend_ids:
+                return jsonify([])
+            users = User.query.filter(User.id.in_(friend_ids)).order_by(User.username).all()
+            return jsonify([_public_user(u) for u in users])
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/constellation/friends/requests')
+    def constellation_friend_requests():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT * FROM friend_requests
+                   WHERE status='pending' AND (requester_id=? OR receiver_id=?)
+                   ORDER BY created_at DESC""",
+                (me, me)
+            )
+            requests = []
+            for row in cur.fetchall():
+                other_id = row['requester_id'] if row['receiver_id'] == me else row['receiver_id']
+                other = db.session.get(User, other_id)
+                if not other:
+                    continue
+                item = dict(row)
+                item['direction'] = 'incoming' if row['receiver_id'] == me else 'outgoing'
+                item['user'] = _public_user(other)
+                requests.append(item)
+            conn.close()
+            return jsonify(requests)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/constellation/friends/request', methods=['POST'])
+    def constellation_send_friend_request():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        data = request.get_json(silent=True) or {}
+        handle = (data.get('handle') or '').strip()
+        if '#' not in handle:
+            return jsonify({'error': 'Enter the full username#0000'}), 400
+        username, tag = handle.rsplit('#', 1)
+        username, tag = username.strip(), tag.strip()
+        if not username or len(tag) != 4 or not tag.isdigit():
+            return jsonify({'error': 'Enter the full username#0000'}), 400
+        target = User.query.filter_by(username=username, user_tag=tag).first()
+        if not target:
+            return jsonify({'error': 'No user found with that tag'}), 404
+        if target.id == me:
+            return jsonify({'error': 'You cannot add yourself'}), 400
+        from datetime import datetime as _dt
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            status = _friendship_status(cur, me, target.id)
+            if status == 'accepted':
+                conn.close()
+                return jsonify({'success': True, 'status': 'accepted', 'message': 'Already friends'})
+            if status == 'pending':
+                conn.close()
+                return jsonify({'success': True, 'status': 'pending', 'message': 'Friend request already pending'})
+            cur.execute(
+                """INSERT OR REPLACE INTO friend_requests(requester_id, receiver_id, status, created_at, responded_at)
+                   VALUES(?,?,?,?,NULL)""",
+                (me, target.id, 'pending', _dt.utcnow().isoformat())
+            )
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'status': 'pending'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/constellation/friends/respond', methods=['POST'])
+    def constellation_respond_friend_request():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        data = request.get_json(silent=True) or {}
+        req_id = int(data.get('request_id') or 0)
+        action = (data.get('action') or '').strip().lower()
+        if action not in ('accept', 'decline'):
+            return jsonify({'error': 'action must be accept or decline'}), 400
+        from datetime import datetime as _dt
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM friend_requests WHERE id=? AND receiver_id=? AND status='pending'", (req_id, me))
+            req_row = cur.fetchone()
+            if not req_row:
+                conn.close()
+                return jsonify({'error': 'request not found'}), 404
+            status = 'accepted' if action == 'accept' else 'declined'
+            cur.execute(
+                "UPDATE friend_requests SET status=?, responded_at=? WHERE id=?",
+                (status, _dt.utcnow().isoformat(), req_id)
+            )
+            if status == 'accepted':
+                _get_or_create_chat(conn, req_row['requester_id'], req_row['receiver_id'])
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'status': status})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
@@ -1456,11 +1881,19 @@ def create_app(config=None):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
         me = int(session.get('user_id') or 0)
+        if other_uid == me:
+            return jsonify({'error': 'choose another user to start a chat'}), 400
+        if not db.session.get(User, other_uid):
+            return jsonify({'error': 'user not found'}), 404
         try:
             dbp = _constellation_db_path()
             conn = sqlite3.connect(dbp)
             conn.row_factory = sqlite3.Row
             _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            if not _are_friends(cur, me, other_uid):
+                conn.close()
+                return jsonify({'error': 'friend request must be accepted before chatting'}), 403
             chat_id = _get_or_create_chat(conn, me, other_uid)
             conn.close()
             return jsonify({'chat_id': chat_id})
@@ -1482,7 +1915,7 @@ def create_app(config=None):
             # Verify membership
             cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
             chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
                 conn.close()
                 return jsonify({'error': 'forbidden'}), 403
             since = request.args.get('since_id', 0, type=int)
@@ -1522,7 +1955,7 @@ def create_app(config=None):
             # Verify membership
             cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
             chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
                 conn.close()
                 return jsonify({'error': 'forbidden'}), 403
             now = _dt.utcnow().isoformat()
@@ -1548,6 +1981,139 @@ def create_app(config=None):
             conn.commit()
             conn.close()
             return jsonify({'success': True, 'id': msg_id, 'topics_found': topics})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- Ideas mode: messages ---
+    @app.route('/api/constellation/ideas/messages/<int:chat_id>')
+    def constellation_idea_messages(chat_id):
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            since = request.args.get('since_id', 0, type=int)
+            cur.execute(
+                "SELECT * FROM idea_messages WHERE chat_id=? AND id>? ORDER BY id ASC",
+                (chat_id, since)
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            return jsonify(rows)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/constellation/ideas/send', methods=['POST'])
+    def constellation_idea_send():
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        data = request.get_json(silent=True) or {}
+        chat_id = int(data.get('chat_id') or 0)
+        content = (data.get('content') or '').strip()
+        if not chat_id or not content:
+            return jsonify({'error': 'chat_id and content required'}), 400
+        from datetime import datetime as _dt
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            now = _dt.utcnow().isoformat()
+            cur.execute(
+                "INSERT INTO idea_messages(chat_id, sender_id, content, created_at) VALUES(?,?,?,?)",
+                (chat_id, me, content, now)
+            )
+            msg_id = cur.lastrowid
+            conn.commit()
+
+            cur.execute(
+                """SELECT sender_id, content, created_at, 'chat' as mode
+                   FROM messages
+                   WHERE chat_id=? AND content IS NOT NULL AND TRIM(content) != ''
+                   ORDER BY id DESC LIMIT 16""",
+                (chat_id,)
+            )
+            chat_context = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """SELECT sender_id, content, created_at, 'ideas' as mode
+                   FROM idea_messages
+                   WHERE chat_id=?
+                   ORDER BY id DESC LIMIT 16""",
+                (chat_id,)
+            )
+            idea_context = [dict(r) for r in cur.fetchall()]
+            context_messages = sorted(
+                chat_context + idea_context,
+                key=lambda r: r.get('created_at') or ''
+            )
+
+            ai_graph = _extract_idea_graph_with_ai(context_messages)
+            topics = ai_graph['nodes'] if ai_graph else _extract_topics(content)
+            node_ids = []
+            for topic in topics:
+                nid = _upsert_idea_node(cur, chat_id, topic, msg_id, now)
+                node_ids.append(nid)
+            if ai_graph:
+                node_by_label = {label.lower(): node_ids[i] for i, label in enumerate(topics)}
+                for src, tgt in ai_graph['edges']:
+                    src_id = node_by_label.get(src.lower())
+                    tgt_id = node_by_label.get(tgt.lower())
+                    if src_id and tgt_id:
+                        _upsert_idea_edge(cur, chat_id, src_id, tgt_id)
+            else:
+                for i in range(len(node_ids)):
+                    for j in range(i + 1, len(node_ids)):
+                        _upsert_idea_edge(cur, chat_id, node_ids[i], node_ids[j])
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'id': msg_id, 'topics_found': topics, 'ai_graph': bool(ai_graph)})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/constellation/ideas/graph/<int:chat_id>')
+    def constellation_idea_graph(chat_id):
+        if 'user' not in session and 'user_id' not in session:
+            return jsonify({'error': 'auth required'}), 401
+        me = int(session.get('user_id') or 0)
+        try:
+            dbp = _constellation_db_path()
+            conn = sqlite3.connect(dbp)
+            conn.row_factory = sqlite3.Row
+            _ensure_constellation_tables(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
+            chat = cur.fetchone()
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
+                conn.close()
+                return jsonify({'error': 'forbidden'}), 403
+            cur.execute(
+                "SELECT id, label, 'idea' as node_type, mention_count FROM idea_nodes WHERE chat_id=? ORDER BY mention_count DESC",
+                (chat_id,)
+            )
+            nodes = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT source_node_id, target_node_id, weight FROM idea_edges WHERE chat_id=?",
+                (chat_id,)
+            )
+            edges = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            return jsonify({'nodes': nodes, 'edges': edges})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
@@ -1577,7 +2143,7 @@ def create_app(config=None):
             cur = conn.cursor()
             cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
             chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
                 conn.close()
                 return jsonify({'error': 'forbidden'}), 403
             # Save file (with Vercel read-only filesystem fallback)
@@ -1639,7 +2205,7 @@ def create_app(config=None):
             cur = conn.cursor()
             cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
             chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
                 conn.close()
                 return jsonify({'error': 'forbidden'}), 403
             cur.execute(
@@ -1671,7 +2237,7 @@ def create_app(config=None):
             cur = conn.cursor()
             cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
             chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']):
+            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
                 conn.close()
                 return jsonify({'error': 'forbidden'}), 403
             
