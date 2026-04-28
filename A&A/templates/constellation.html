@@ -302,7 +302,7 @@
 <script>
 const ME = {{ session.get('user_id', 0) }};
 const MY_NAME = {{ (session.get('user', '') or '') | tojson }};
-const OPEN_UID = {{ open_uid if open_uid is defined else 'null' }};
+const OPEN_UID = {% if open_uid is defined %}{{ open_uid | tojson }}{% else %}null{% endif %};
 
 let activeChatId = null;
 let activeOtherUid = null;
@@ -465,7 +465,7 @@ async function openChat(user){
   document.getElementById('chat-name').textContent = user.display_name || user.username;
   document.getElementById('chat-sub').textContent = '@' + user.username;
 
-  const res = await fetch(`/api/constellation/chat/${user.id}`);
+  const res = await fetch(`/api/constellation/chat/${encodeURIComponent(user.id)}`);
   const data = await res.json();
   if(!res.ok || !data.chat_id){
     setFriendStatus(data.error || 'Could not open chat.');
@@ -488,17 +488,18 @@ async function openChat(user){
 }
 
 function modeEndpoints(){
+  const encChatId = encodeURIComponent(activeChatId);
   if (activeMode === 'ideas') {
     return {
-      messages: `/api/constellation/ideas/messages/${activeChatId}`,
+      messages: `/api/constellation/ideas/messages/${encChatId}`,
       send: '/api/constellation/ideas/send',
-      graph: `/api/constellation/ideas/graph/${activeChatId}`
+      graph: `/api/constellation/ideas/graph/${encChatId}`
     };
   }
   return {
-    messages: `/api/constellation/messages/${activeChatId}`,
+    messages: `/api/constellation/messages/${encChatId}`,
     send: '/api/constellation/send',
-    graph: `/api/constellation/graph/${activeChatId}`
+    graph: `/api/constellation/graph/${encChatId}`
   };
 }
 
@@ -731,7 +732,7 @@ function renderGraph(data){
     if(!selectedNode || activeMode !== 'chat') return;
     if(confirm(`Delete "${selectedNode.label}" from the constellation?`)){
       try {
-        const r = await fetch(`/api/constellation/node/${activeChatId}/${selectedNode.id}`, { method: 'DELETE' });
+        const r = await fetch(`/api/constellation/node/${encodeURIComponent(activeChatId)}/${encodeURIComponent(selectedNode.id)}`, { method: 'DELETE' });
         const res = await r.json();
         if(res.success){
           selectedNode = null;

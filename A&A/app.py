@@ -1912,7 +1912,7 @@ def create_app(config=None):
             return redirect(url_for('login'))
         return render_template('constellation.html')
 
-    @app.route('/constellation/<int:other_uid>')
+    @app.route('/constellation/<path:other_uid>')
     def constellation_chat(other_uid):
         if 'user' not in session and 'user_id' not in session:
             return redirect(url_for('login'))
@@ -2634,11 +2634,23 @@ def create_app(config=None):
             return jsonify({'error': str(e)}), 500
 
     # --- API: delete a node from the graph ---
-    @app.route('/api/constellation/node/<int:chat_id>/<int:node_id>', methods=['DELETE'])
+    @app.route('/api/constellation/node/<path:chat_id>/<path:node_id>', methods=['DELETE'])
     def constellation_delete_node(chat_id, node_id):
         if 'user' not in session and 'user_id' not in session:
             return jsonify({'error': 'auth required'}), 401
+
+        if _mongo_available():
+            current = _mongo_current_user()
+            chat = _mongo_db().chats.find_one({'chat_id': str(chat_id), 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            _mongo_db().graph_nodes.delete_one({'chat_id': str(chat_id), 'label_lc': str(node_id)})
+            _mongo_db().graph_edges.delete_many({'chat_id': str(chat_id), '$or': [{'source_label_lc': str(node_id)}, {'target_label_lc': str(node_id)}]})
+            return jsonify({'success': True})
+
         me = int(session.get('user_id') or 0)
+        chat_id = int(chat_id)
+        node_id = int(node_id)
         try:
             dbp = _constellation_db_path()
             conn = sqlite3.connect(dbp)
