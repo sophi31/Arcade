@@ -548,15 +548,38 @@ async function sendMessage(){
   inp.value = '';
   inp.style.height = 'auto';
   const endpoints = modeEndpoints();
+  
+  // Display message optimistically
+  const box = document.getElementById('messages');
+  const bubble = document.createElement('div');
+  bubble.className = `msg-bubble sent ${activeMode === 'ideas' ? 'idea' : ''}`;
+  bubble.dataset.msgId = 'temp-' + Date.now();
+  bubble.innerHTML = `${escHtml(content)}<div class="msg-time">${fmtTime(new Date().toISOString())}</div>`;
+  bubble.style.opacity = '0.7';
+  box.appendChild(bubble);
+  box.scrollTop = box.scrollHeight;
+  
   try{
-    await fetch(endpoints.send, {
+    const r = await fetch(endpoints.send, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({chat_id: activeChatId, content})
     });
+    const result = await r.json();
+    if(result.error){
+      console.error('Send error:', result.error);
+      bubble.style.opacity = '0.4';
+      bubble.style.textDecoration = 'line-through';
+      return;
+    }
+    bubble.style.opacity = '1';
     await loadMessages();
     await refreshGraph();
-  } catch(e){}
+  } catch(e){
+    console.error('Send exception:', e);
+    bubble.style.opacity = '0.4';
+    bubble.style.textDecoration = 'line-through';
+  }
 }
 
 document.getElementById('send-btn').addEventListener('click', sendMessage);

@@ -9,7 +9,7 @@ import urllib.error
 from flask import Flask, render_template, request, session, redirect, url_for, flash, jsonify, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from models import db, User
+from models import db, User, ConstellationChat, ConstellationMessage, ConstellationNode, ConstellationEdge
 
 from sqlalchemy import text, func
 
@@ -2249,32 +2249,37 @@ def create_app(config=None):
                     'created_at': r.get('created_at')
                 })
             return jsonify(rows)
-        chat_id = int(chat_id)
+        
+        # Use SQLAlchemy models
         me = int(session.get('user_id') or 0)
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
+            chat_id = int(chat_id)
             # Verify membership
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
+            
             since = request.args.get('since_id', 0, type=int)
-            cur.execute(
-                "SELECT * FROM messages WHERE chat_id=? AND id>? ORDER BY id ASC",
-                (chat_id, since)
-            )
+            msgs = ConstellationMessage.query.filter(
+                ConstellationMessage.chat_id == chat_id,
+                ConstellationMessage.id > since
+            ).order_by(ConstellationMessage.id.asc()).limit(100).all()
+            
             rows = []
-            for r in cur.fetchall():
-                d = dict(r)
-                if d.get('file_path'):
-                    d['file_url'] = url_for('static', filename=d['file_path'])
+            for msg in msgs:
+                d = {
+                    'id': msg.id,
+                    'sender_id': msg.sender_id,
+                    'content': msg.content,
+                    'created_at': msg.created_at,
+                    'file_path': msg.file_path,
+                    'file_name': msg.file_name,
+                    'file_type': msg.file_type
+                }
+                if msg.file_path:
+                    d['file_url'] = url_for('static', filename=msg.file_path)
                 rows.append(d)
-            conn.close()
+            
             return jsonify(rows)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -2308,45 +2313,77 @@ def create_app(config=None):
                     edges.append((topics[i], topics[j]))
             _mongo_upsert_graph('chat', chat_id, topics, edges)
             return jsonify({'success': True, 'id': str(inserted.inserted_id), 'topics_found': topics})
+        
+        # Use SQLAlchemy models for persistence
         me = int(session.get('user_id') or 0)
         chat_id = int(chat_id_raw)
         from datetime import datetime as _dt
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            # Verify membership
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership using SQLAlchemy models
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
+            
             now = _dt.utcnow().isoformat()
-            cur.execute(
-                "INSERT INTO messages(chat_id, sender_id, content, created_at) VALUES(?,?,?,?)",
-                (chat_id, me, content, now)
+            msg = ConstellationMessage(
+                chat_id=chat.id,
+                sender_id=me,
+                content=content,
+                created_at=now
             )
-            msg_id = cur.lastrowid
-            conn.commit()
+            db.session.add(msg)
+            db.session.flush()  # Get the message ID
+            msg_id = msg.id
+            db.session.commit()
+            
             # Topic extraction + graph update
             topics = _extract_topics(content)
             node_ids = []
             for topic in topics:
-                nid = _upsert_node(cur, chat_id, topic, 'topic', msg_id, now)
-                node_ids.append(nid)
+                node = ConstellationNode.query.filter_by(
+                    chat_id=chat.id,
+                    label=topic
+                ).first()
+                if not node:
+                    node = ConstellationNode(
+                        chat_id=chat.id,
+                        label=topic,
+                        node_type='topic',
+                        source_message_id=msg_id,
+                        mention_count=1,
+                        created_at=now
+                    )
+                    db.session.add(node)
+                    db.session.flush()
+                else:
+                    node.mention_count += 1
+                    db.session.add(node)
+                    db.session.flush()
+                node_ids.append(node.id)
             
             # Connect all co-occurring topics in the same message
             for i in range(len(node_ids)):
                 for j in range(i + 1, len(node_ids)):
-                    _upsert_edge(cur, chat_id, node_ids[i], node_ids[j])
+                    edge = ConstellationEdge.query.filter_by(
+                        chat_id=chat.id,
+                        source_node_id=node_ids[i],
+                        target_node_id=node_ids[j]
+                    ).first()
+                    if edge:
+                        edge.weight += 1
+                    else:
+                        edge = ConstellationEdge(
+                            chat_id=chat.id,
+                            source_node_id=node_ids[i],
+                            target_node_id=node_ids[j],
+                            weight=1
+                        )
+                        db.session.add(edge)
             
-            # Fallback: if message only had one topic and no existing connections, it will naturally form its own separated cluster.
-            conn.commit()
-            conn.close()
+            db.session.commit()
             return jsonify({'success': True, 'id': msg_id, 'topics_found': topics})
         except Exception as e:
+            db.session.rollback()
             return jsonify({'error': str(e)}), 500
 
     # --- Ideas mode: messages ---
