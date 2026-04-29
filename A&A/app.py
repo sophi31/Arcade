@@ -127,10 +127,15 @@ def create_app(config=None):
             db.session.commit()
         return getattr(user, 'user_tag', None) if user else None
 
+    def _mongo_configured():
+        return bool((os.getenv('MONGODB_URI') or '').strip()) and MongoClient is not None
+
     def _mongo_enabled():
-        return bool((os.getenv('MONGODB_URI') or '').strip()) and MongoClient is not None and not getattr(app, 'mongo_failed', False)
+        return _mongo_configured()
 
     def _mongo_available():
+        if os.environ.get('VERCEL') == '1' and _mongo_configured():
+            return True
         return _mongo_db() is not None
 
     def _mongo_db():
@@ -143,7 +148,10 @@ def create_app(config=None):
                 app.mongo_db = app.mongo_client[(os.getenv('MONGODB_DB') or 'arcade').strip() or 'arcade']
                 _ensure_mongo_indexes(app.mongo_db)
             except Exception as exc:
-                app.mongo_failed = True
+                if hasattr(app, 'mongo_client'):
+                    delattr(app, 'mongo_client')
+                if hasattr(app, 'mongo_db'):
+                    delattr(app, 'mongo_db')
                 app.logger.warning("MongoDB connection unavailable; falling back to local storage: %s", exc)
                 return None
         return app.mongo_db
@@ -2217,7 +2225,10 @@ def create_app(config=None):
             return jsonify({'error': 'auth required'}), 401
         if _mongo_available():
             current = _mongo_current_user()
-            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             since = request.args.get('since_id', '')
@@ -2230,7 +2241,7 @@ def create_app(config=None):
                 except (InvalidId, TypeError):
                     pass
             rows = []
-            for r in _mongo_db().messages.find(query).sort('created_at', ASCENDING).limit(100):
+            for r in mdb.messages.find(query).sort('created_at', ASCENDING).limit(100):
                 rows.append({
                     'id': str(r['_id']),
                     'sender_id': r.get('sender_key'),
@@ -2280,13 +2291,16 @@ def create_app(config=None):
             return jsonify({'error': 'chat_id and content required'}), 400
         if _mongo_available():
             current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
             chat_id = str(chat_id_raw)
-            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             from datetime import datetime as _dt
             now = _dt.utcnow().isoformat()
-            inserted = _mongo_db().messages.insert_one({'chat_id': chat_id, 'sender_key': current['_id'], 'content': content, 'created_at': now})
+            inserted = mdb.messages.insert_one({'chat_id': chat_id, 'sender_key': current['_id'], 'content': content, 'created_at': now})
             topics = _extract_topics(content)
             edges = []
             for i in range(len(topics)):
@@ -2342,7 +2356,10 @@ def create_app(config=None):
             return jsonify({'error': 'auth required'}), 401
         if _mongo_available():
             current = _mongo_current_user()
-            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             since = request.args.get('since_id', '')
@@ -2359,7 +2376,7 @@ def create_app(config=None):
                 'sender_id': r.get('sender_key'),
                 'content': r.get('content'),
                 'created_at': r.get('created_at')
-            } for r in _mongo_db().idea_messages.find(query).sort('created_at', ASCENDING).limit(100)]
+            } for r in mdb.idea_messages.find(query).sort('created_at', ASCENDING).limit(100)]
             return jsonify(rows)
         chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
@@ -2396,15 +2413,18 @@ def create_app(config=None):
             return jsonify({'error': 'chat_id and content required'}), 400
         if _mongo_available():
             current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
             chat_id = str(chat_id_raw)
-            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             from datetime import datetime as _dt
             now = _dt.utcnow().isoformat()
-            inserted = _mongo_db().idea_messages.insert_one({'chat_id': chat_id, 'sender_key': current['_id'], 'content': content, 'created_at': now})
-            recent = list(_mongo_db().messages.find({'chat_id': chat_id}).sort('created_at', DESCENDING).limit(16))
-            recent += list(_mongo_db().idea_messages.find({'chat_id': chat_id}).sort('created_at', DESCENDING).limit(16))
+            inserted = mdb.idea_messages.insert_one({'chat_id': chat_id, 'sender_key': current['_id'], 'content': content, 'created_at': now})
+            recent = list(mdb.messages.find({'chat_id': chat_id}).sort('created_at', DESCENDING).limit(16))
+            recent += list(mdb.idea_messages.find({'chat_id': chat_id}).sort('created_at', DESCENDING).limit(16))
             context_messages = sorted([
                 {'sender_id': r.get('sender_key'), 'content': r.get('content'), 'created_at': r.get('created_at'), 'mode': 'ideas' if 'idea' in str(r.get('_id')) else 'chat'}
                 for r in recent
@@ -2486,7 +2506,10 @@ def create_app(config=None):
             return jsonify({'error': 'auth required'}), 401
         if _mongo_available():
             current = _mongo_current_user()
-            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             return jsonify(_mongo_graph('ideas', chat_id))
@@ -2601,7 +2624,10 @@ def create_app(config=None):
             return jsonify({'error': 'auth required'}), 401
         if _mongo_available():
             current = _mongo_current_user()
-            chat = _mongo_db().chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             return jsonify(_mongo_graph('chat', chat_id))
@@ -2641,11 +2667,14 @@ def create_app(config=None):
 
         if _mongo_available():
             current = _mongo_current_user()
-            chat = _mongo_db().chats.find_one({'chat_id': str(chat_id), 'participants': current['_id']})
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance. Check MONGODB_URI and Atlas network access.'}), 503
+            mdb = _mongo_db()
+            chat = mdb.chats.find_one({'chat_id': str(chat_id), 'participants': current['_id']})
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
-            _mongo_db().graph_nodes.delete_one({'chat_id': str(chat_id), 'label_lc': str(node_id)})
-            _mongo_db().graph_edges.delete_many({'chat_id': str(chat_id), '$or': [{'source_label_lc': str(node_id)}, {'target_label_lc': str(node_id)}]})
+            mdb.graph_nodes.delete_one({'chat_id': str(chat_id), 'label_lc': str(node_id)})
+            mdb.graph_edges.delete_many({'chat_id': str(chat_id), '$or': [{'source_label_lc': str(node_id)}, {'target_label_lc': str(node_id)}]})
             return jsonify({'success': True})
 
         me = int(session.get('user_id') or 0)
