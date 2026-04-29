@@ -33,6 +33,14 @@ class ConstellationMessage(db.Model):
     file_type = db.Column(db.String(50))
     created_at = db.Column(db.String(255), nullable=False, default=lambda: datetime.utcnow().isoformat())
 
+class IdeaMessage(db.Model):
+    __tablename__ = 'idea_messages'
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.Integer, db.ForeignKey('constellation_chats.id'), nullable=False)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    content = db.Column(db.Text)
+    created_at = db.Column(db.String(255), nullable=False, default=lambda: datetime.utcnow().isoformat())
+
 class ConstellationNode(db.Model):
     __tablename__ = 'constellation_nodes'
     id = db.Column(db.Integer, primary_key=True)
@@ -45,6 +53,17 @@ class ConstellationNode(db.Model):
     
     __table_args__ = (db.UniqueConstraint('chat_id', 'label', name='_constellation_node_uc'),)
 
+class IdeaNode(db.Model):
+    __tablename__ = 'idea_nodes'
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.Integer, db.ForeignKey('constellation_chats.id'), nullable=False)
+    label = db.Column(db.String(255), nullable=False)
+    source_message_id = db.Column(db.Integer, db.ForeignKey('idea_messages.id'))
+    mention_count = db.Column(db.Integer, default=1)
+    created_at = db.Column(db.String(255), nullable=False, default=lambda: datetime.utcnow().isoformat())
+    
+    __table_args__ = (db.UniqueConstraint('chat_id', 'label', name='_idea_node_uc'),)
+
 class ConstellationEdge(db.Model):
     __tablename__ = 'constellation_edges'
     id = db.Column(db.Integer, primary_key=True)
@@ -54,3 +73,13 @@ class ConstellationEdge(db.Model):
     weight = db.Column(db.Integer, default=1)
     
     __table_args__ = (db.UniqueConstraint('chat_id', 'source_node_id', 'target_node_id', name='_constellation_edge_uc'),)
+
+class IdeaEdge(db.Model):
+    __tablename__ = 'idea_edges'
+    id = db.Column(db.Integer, primary_key=True)
+    chat_id = db.Column(db.Integer, db.ForeignKey('constellation_chats.id'), nullable=False)
+    source_node_id = db.Column(db.Integer, db.ForeignKey('idea_nodes.id'), nullable=False)
+    target_node_id = db.Column(db.Integer, db.ForeignKey('idea_nodes.id'), nullable=False)
+    weight = db.Column(db.Integer, default=1)
+    
+    __table_args__ = (db.UniqueConstraint('chat_id', 'source_node_id', 'target_node_id', name='_idea_edge_uc'),)

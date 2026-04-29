@@ -9,7 +9,7 @@ import urllib.error
 from flask import Flask, render_template, request, session, redirect, url_for, flash, jsonify, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from models import db, User, ConstellationChat, ConstellationMessage, ConstellationNode, ConstellationEdge
+from models import db, User, ConstellationChat, ConstellationMessage, IdeaMessage, ConstellationNode, IdeaNode, ConstellationEdge, IdeaEdge
 
 from sqlalchemy import text, func
 
@@ -2432,26 +2432,31 @@ def create_app(config=None):
                 'created_at': r.get('created_at')
             } for r in mdb.idea_messages.find(query).sort('created_at', ASCENDING).limit(100)]
             return jsonify(rows)
+        
+        # Use SQLAlchemy models
         chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
+            
             since = request.args.get('since_id', 0, type=int)
-            cur.execute(
-                "SELECT * FROM idea_messages WHERE chat_id=? AND id>? ORDER BY id ASC",
-                (chat_id, since)
-            )
-            rows = [dict(r) for r in cur.fetchall()]
-            conn.close()
+            msgs = IdeaMessage.query.filter(
+                IdeaMessage.chat_id == chat_id,
+                IdeaMessage.id > since
+            ).order_by(IdeaMessage.id.asc()).limit(100).all()
+            
+            rows = []
+            for msg in msgs:
+                rows.append({
+                    'id': msg.id,
+                    'sender_id': msg.sender_id,
+                    'content': msg.content,
+                    'created_at': msg.created_at
+                })
+            
             return jsonify(rows)
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -2488,70 +2493,76 @@ def create_app(config=None):
             edges = ai_graph['edges'] if ai_graph else [(topics[i], topics[j]) for i in range(len(topics)) for j in range(i + 1, len(topics))]
             _mongo_upsert_graph('ideas', chat_id, topics, edges)
             return jsonify({'success': True, 'id': str(inserted.inserted_id), 'topics_found': topics, 'ai_graph': bool(ai_graph)})
+        
+        # Use SQLAlchemy models
         me = int(session.get('user_id') or 0)
         chat_id = int(chat_id_raw)
         from datetime import datetime as _dt
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
+            
             now = _dt.utcnow().isoformat()
-            cur.execute(
-                "INSERT INTO idea_messages(chat_id, sender_id, content, created_at) VALUES(?,?,?,?)",
-                (chat_id, me, content, now)
+            msg = IdeaMessage(
+                chat_id=chat.id,
+                sender_id=me,
+                content=content,
+                created_at=now
             )
-            msg_id = cur.lastrowid
-            conn.commit()
-
-            cur.execute(
-                """SELECT sender_id, content, created_at, 'chat' as mode
-                   FROM messages
-                   WHERE chat_id=? AND content IS NOT NULL AND TRIM(content) != ''
-                   ORDER BY id DESC LIMIT 16""",
-                (chat_id,)
-            )
-            chat_context = [dict(r) for r in cur.fetchall()]
-            cur.execute(
-                """SELECT sender_id, content, created_at, 'ideas' as mode
-                   FROM idea_messages
-                   WHERE chat_id=?
-                   ORDER BY id DESC LIMIT 16""",
-                (chat_id,)
-            )
-            idea_context = [dict(r) for r in cur.fetchall()]
-            context_messages = sorted(
-                chat_context + idea_context,
-                key=lambda r: r.get('created_at') or ''
-            )
-
-            ai_graph = _extract_idea_graph_with_ai(context_messages)
-            topics = ai_graph['nodes'] if ai_graph else _extract_topics(content)
+            db.session.add(msg)
+            db.session.flush()
+            msg_id = msg.id
+            db.session.commit()
+            
+            # Topic extraction + graph update
+            topics = _extract_topics(content)
             node_ids = []
             for topic in topics:
-                nid = _upsert_idea_node(cur, chat_id, topic, msg_id, now)
-                node_ids.append(nid)
-            if ai_graph:
-                node_by_label = {label.lower(): node_ids[i] for i, label in enumerate(topics)}
-                for src, tgt in ai_graph['edges']:
-                    src_id = node_by_label.get(src.lower())
-                    tgt_id = node_by_label.get(tgt.lower())
-                    if src_id and tgt_id:
-                        _upsert_idea_edge(cur, chat_id, src_id, tgt_id)
-            else:
-                for i in range(len(node_ids)):
-                    for j in range(i + 1, len(node_ids)):
-                        _upsert_idea_edge(cur, chat_id, node_ids[i], node_ids[j])
-            conn.commit()
-            conn.close()
-            return jsonify({'success': True, 'id': msg_id, 'topics_found': topics, 'ai_graph': bool(ai_graph)})
+                node = IdeaNode.query.filter_by(
+                    chat_id=chat.id,
+                    label=topic
+                ).first()
+                if not node:
+                    node = IdeaNode(
+                        chat_id=chat.id,
+                        label=topic,
+                        source_message_id=msg_id,
+                        mention_count=1,
+                        created_at=now
+                    )
+                    db.session.add(node)
+                    db.session.flush()
+                else:
+                    node.mention_count += 1
+                    db.session.add(node)
+                    db.session.flush()
+                node_ids.append(node.id)
+            
+            # Connect all co-occurring topics in the same message
+            for i in range(len(node_ids)):
+                for j in range(i + 1, len(node_ids)):
+                    edge = IdeaEdge.query.filter_by(
+                        chat_id=chat.id,
+                        source_node_id=node_ids[i],
+                        target_node_id=node_ids[j]
+                    ).first()
+                    if edge:
+                        edge.weight += 1
+                    else:
+                        edge = IdeaEdge(
+                            chat_id=chat.id,
+                            source_node_id=node_ids[i],
+                            target_node_id=node_ids[j],
+                            weight=1
+                        )
+                        db.session.add(edge)
+            
+            db.session.commit()
+            return jsonify({'success': True, 'id': msg_id, 'topics_found': topics, 'ai_graph': False})
         except Exception as e:
+            db.session.rollback()
             return jsonify({'error': str(e)}), 500
 
     @app.route('/api/constellation/ideas/graph/<path:chat_id>')
@@ -2567,30 +2578,37 @@ def create_app(config=None):
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             return jsonify(_mongo_graph('ideas', chat_id))
+        
+        # Use SQLAlchemy models
         chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
-            cur.execute(
-                "SELECT id, label, 'idea' as node_type, mention_count FROM idea_nodes WHERE chat_id=? ORDER BY mention_count DESC",
-                (chat_id,)
-            )
-            nodes = [dict(r) for r in cur.fetchall()]
-            cur.execute(
-                "SELECT source_node_id, target_node_id, weight FROM idea_edges WHERE chat_id=?",
-                (chat_id,)
-            )
-            edges = [dict(r) for r in cur.fetchall()]
-            conn.close()
+            
+            # Get idea nodes
+            nodes_query = IdeaNode.query.filter_by(chat_id=chat_id).order_by(IdeaNode.mention_count.desc()).all()
+            nodes = []
+            for n in nodes_query:
+                nodes.append({
+                    'id': n.id,
+                    'label': n.label,
+                    'node_type': 'idea',
+                    'mention_count': n.mention_count
+                })
+            
+            # Get idea edges
+            edges_query = IdeaEdge.query.filter_by(chat_id=chat_id).all()
+            edges = []
+            for e in edges_query:
+                edges.append({
+                    'source_node_id': e.source_node_id,
+                    'target_node_id': e.target_node_id,
+                    'weight': e.weight
+                })
+            
             return jsonify({'nodes': nodes, 'edges': edges})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
