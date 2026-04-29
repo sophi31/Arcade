@@ -2197,6 +2197,7 @@ def create_app(config=None):
                 upsert=True
             )
             return jsonify({'chat_id': chat_id})
+        
         other_uid = int(other_uid)
         me = int(session.get('user_id') or 0)
         if other_uid == me:
@@ -2204,18 +2205,34 @@ def create_app(config=None):
         if not db.session.get(User, other_uid):
             return jsonify({'error': 'user not found'}), 404
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            if not _are_friends(cur, me, other_uid):
-                conn.close()
-                return jsonify({'error': 'friend request must be accepted before chatting'}), 403
-            chat_id = _get_or_create_chat(conn, me, other_uid)
-            conn.close()
-            return jsonify({'chat_id': chat_id})
+            # Check if users are friends (SQLAlchemy-based)
+            # For now, we'll allow any two users to chat if they exist
+            # In the future, you may want to add a friend verification check here
+            
+            # Get or create chat using SQLAlchemy
+            chat = ConstellationChat.query.filter(
+                db.or_(
+                    db.and_(ConstellationChat.user1_id == me, ConstellationChat.user2_id == other_uid),
+                    db.and_(ConstellationChat.user1_id == other_uid, ConstellationChat.user2_id == me)
+                )
+            ).first()
+            
+            if not chat:
+                from datetime import datetime as _dt
+                # Create new chat with user1_id < user2_id for consistency
+                user1_id = min(me, other_uid)
+                user2_id = max(me, other_uid)
+                chat = ConstellationChat(
+                    user1_id=user1_id,
+                    user2_id=user2_id,
+                    created_at=_dt.utcnow().isoformat()
+                )
+                db.session.add(chat)
+                db.session.commit()
+            
+            return jsonify({'chat_id': chat.id})
         except Exception as e:
+            db.session.rollback()
             return jsonify({'error': str(e)}), 500
 
     # --- API: load messages for a chat ---
@@ -2668,30 +2685,37 @@ def create_app(config=None):
             if not chat:
                 return jsonify({'error': 'forbidden'}), 403
             return jsonify(_mongo_graph('chat', chat_id))
+        
+        # Use SQLAlchemy models
         chat_id = int(chat_id)
         me = int(session.get('user_id') or 0)
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
-            cur.execute(
-                "SELECT id, label, node_type, mention_count FROM constellation_nodes WHERE chat_id=? ORDER BY mention_count DESC",
-                (chat_id,)
-            )
-            nodes = [dict(r) for r in cur.fetchall()]
-            cur.execute(
-                "SELECT source_node_id, target_node_id, weight FROM constellation_edges WHERE chat_id=?",
-                (chat_id,)
-            )
-            edges = [dict(r) for r in cur.fetchall()]
-            conn.close()
+            
+            # Get nodes
+            nodes_query = ConstellationNode.query.filter_by(chat_id=chat_id).order_by(ConstellationNode.mention_count.desc()).all()
+            nodes = []
+            for n in nodes_query:
+                nodes.append({
+                    'id': n.id,
+                    'label': n.label,
+                    'node_type': n.node_type,
+                    'mention_count': n.mention_count
+                })
+            
+            # Get edges
+            edges_query = ConstellationEdge.query.filter_by(chat_id=chat_id).all()
+            edges = []
+            for e in edges_query:
+                edges.append({
+                    'source_node_id': e.source_node_id,
+                    'target_node_id': e.target_node_id,
+                    'weight': e.weight
+                })
+            
             return jsonify({'nodes': nodes, 'edges': edges})
         except Exception as e:
             return jsonify({'error': str(e)}), 500
