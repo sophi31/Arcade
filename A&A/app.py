@@ -10,7 +10,6 @@ from flask import Flask, render_template, request, session, redirect, url_for, f
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from models import db, User
-from flask_socketio import SocketIO, emit, join_room, leave_room
 
 from sqlalchemy import text, func
 
