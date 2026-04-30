@@ -195,7 +195,7 @@ def create_app(config=None):
         return bool(os.getenv('CLOUDINARY_CLOUD_NAME') and os.getenv('CLOUDINARY_API_KEY') and os.getenv('CLOUDINARY_API_SECRET'))
 
     def _cloudinary_upload(file_obj, folder='constellation', resource_type='auto'):
-        """Upload a file-like object to Cloudinary and return the secure URL."""
+        """Upload a file-like object to Cloudinary and return (secure_url, error)."""
         if not _CLOUDINARY_AVAILABLE:
             return None, 'Cloudinary package not installed'
         cloud_url = (os.getenv('CLOUDINARY_URL') or '').strip()
@@ -209,8 +209,11 @@ def create_app(config=None):
                 secure=True
             )
         try:
+            # Read bytes from the file object so Cloudinary receives a bytes buffer
+            import io
+            file_bytes = file_obj.read()
             result = cloudinary.uploader.upload(
-                file_obj,
+                io.BytesIO(file_bytes),
                 folder=folder,
                 resource_type=resource_type,
                 use_filename=True,
@@ -2346,10 +2349,13 @@ def create_app(config=None):
             for r in mdb.messages.find(query).sort('created_at', ASCENDING).limit(100):
                 rows.append({
                     'id': str(r['_id']),
-                    # sender_id must match myKey format on the frontend (MongoDB _id = username string)
+                    # sender_id matches myKey (MongoDB _id = username string)
                     'sender_id': r.get('sender_key'),
                     'content': r.get('content'),
-                    'created_at': r.get('created_at')
+                    'created_at': r.get('created_at'),
+                    'file_url': r.get('file_url'),
+                    'file_name': r.get('file_name'),
+                    'file_type': r.get('file_type'),
                 })
             return jsonify(rows)
         
@@ -2728,9 +2734,7 @@ def create_app(config=None):
         file = request.files.get('file')
         if not chat_id_raw or not file or not getattr(file, 'filename', ''):
             return jsonify({'error': 'chat_id and file required'}), 400
-        if _mongo_available():
-            return jsonify({'error': 'File uploads are not available on Vercel Mongo chat yet'}), 400
-        chat_id = int(chat_id_raw)
+
         fname = secure_filename(file.filename)
         ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
         allowed = {'pdf', 'png', 'jpg', 'jpeg', 'txt', 'doc', 'docx', 'xls', 'xlsx', 'webp'}
@@ -2772,20 +2776,54 @@ def create_app(config=None):
                 'file_type': file_type,
                 'created_at': now
             })
-            # Upsert file node and related topic nodes in graph
-            normalized_name = fname.lower().replace('_', ' ').replace('-', ' ')
+            # ---- Upsert file node + topic nodes + edges in graph ----
             file_label = file.filename
+            file_label_lc = file_label.lower()
+            # Upsert the file node
             mdb.graph_nodes.update_one(
-                {'chat_id': chat_id, 'mode': 'chat', 'label_lc': file_label.lower()},
+                {'chat_id': chat_id, 'mode': 'chat', 'label_lc': file_label_lc},
                 {'$setOnInsert': {'chat_id': chat_id, 'mode': 'chat', 'label': file_label, 'node_type': 'file'},
                  '$inc': {'mention_count': 1}},
                 upsert=True
             )
+            # Upsert topic nodes and connect each one to the file node via an edge
+            normalized_name = fname.lower().replace('_', ' ').replace('-', ' ')
+            topics = _extract_topics(normalized_name)
             if topics:
-                _mongo_upsert_graph('chat', chat_id, topics, edges)
+                for topic in _dedupe_labels(topics, max_items=6):
+                    topic_lc = topic.lower()
+                    mdb.graph_nodes.update_one(
+                        {'chat_id': chat_id, 'mode': 'chat', 'label_lc': topic_lc},
+                        {'$setOnInsert': {'chat_id': chat_id, 'mode': 'chat', 'label': topic, 'node_type': 'topic'},
+                         '$inc': {'mention_count': 1}},
+                        upsert=True
+                    )
+                    # Edge between file node and topic node (sorted for uniqueness)
+                    a, b = sorted([file_label_lc, topic_lc])
+                    mdb.graph_edges.update_one(
+                        {'chat_id': chat_id, 'mode': 'chat', 'source_label_lc': a, 'target_label_lc': b},
+                        {'$setOnInsert': {'chat_id': chat_id, 'mode': 'chat',
+                                          'source_label': a, 'target_label': b},
+                         '$inc': {'weight': 1}},
+                        upsert=True
+                    )
             else:
-                # Fallback hub node
-                _mongo_upsert_graph('chat', chat_id, ['Shared Files'], [])
+                # Fallback: connect file to a generic "Shared Files" hub node
+                hub_lc = 'shared files'
+                mdb.graph_nodes.update_one(
+                    {'chat_id': chat_id, 'mode': 'chat', 'label_lc': hub_lc},
+                    {'$setOnInsert': {'chat_id': chat_id, 'mode': 'chat', 'label': 'Shared Files', 'node_type': 'topic'},
+                     '$inc': {'mention_count': 1}},
+                    upsert=True
+                )
+                a, b = sorted([file_label_lc, hub_lc])
+                mdb.graph_edges.update_one(
+                    {'chat_id': chat_id, 'mode': 'chat', 'source_label_lc': a, 'target_label_lc': b},
+                    {'$setOnInsert': {'chat_id': chat_id, 'mode': 'chat',
+                                      'source_label': a, 'target_label': b},
+                     '$inc': {'weight': 1}},
+                    upsert=True
+                )
             return jsonify({'success': True, 'id': str(inserted.inserted_id), 'file_url': file_url})
 
         # --- SQLite / local path ---
