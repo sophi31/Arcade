@@ -572,7 +572,7 @@ async function sendMessage(){
       bubble.style.textDecoration = 'line-through';
       return;
     }
-    bubble.style.opacity = '1';
+    bubble.remove();
     await loadMessages();
     await refreshGraph();
   } catch(e){

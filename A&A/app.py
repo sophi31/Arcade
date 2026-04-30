@@ -2264,12 +2264,18 @@ def create_app(config=None):
                     pass
             rows = []
             for r in mdb.messages.find(query).sort('created_at', ASCENDING).limit(100):
-                rows.append({
+                d = {
                     'id': str(r['_id']),
                     'sender_id': r.get('sender_key'),
                     'content': r.get('content'),
                     'created_at': r.get('created_at')
-                })
+                }
+                if r.get('file_path'):
+                    d['file_path'] = r.get('file_path')
+                    d['file_url'] = r.get('file_path')  # Use the same for url
+                    d['file_name'] = r.get('file_name')
+                    d['file_type'] = r.get('file_type')
+                rows.append(d)
             return jsonify(rows)
         
         # Use SQLAlchemy models
@@ -2299,7 +2305,7 @@ def create_app(config=None):
                     'file_type': msg.file_type
                 }
                 if msg.file_path:
-                    d['file_url'] = url_for('static', filename=msg.file_path)
+                    d['file_url'] = url_for('static', filename=msg.file_path) if not msg.file_path.startswith('/api/') else msg.file_path
                 rows.append(d)
             
             return jsonify(rows)
@@ -2618,6 +2624,22 @@ def create_app(config=None):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
+    @app.route('/api/constellation/file/<file_id>')
+    def constellation_file(file_id):
+        if not _mongo_available():
+            return "MongoDB not available", 503
+        mdb = _mongo_db()
+        import gridfs
+        from bson import ObjectId
+        fs = gridfs.GridFS(mdb)
+        try:
+            grid_out = fs.get(ObjectId(file_id))
+            from flask import send_file
+            import io
+            return send_file(io.BytesIO(grid_out.read()), mimetype=grid_out.content_type, download_name=grid_out.filename)
+        except Exception as e:
+            return "File not found", 404
+
     # --- API: upload file ---
     @app.route('/api/constellation/upload', methods=['POST'])
     def constellation_upload():
@@ -2629,7 +2651,48 @@ def create_app(config=None):
         if not chat_id_raw or not file or not getattr(file, 'filename', ''):
             return jsonify({'error': 'chat_id and file required'}), 400
         if _mongo_available():
-            return jsonify({'error': 'File uploads are not available on Vercel Mongo chat yet'}), 400
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'MongoDB is unavailable on this Vercel instance.'}), 503
+            mdb = _mongo_db()
+            chat_id = str(chat_id_raw)
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            
+            import gridfs
+            fs = gridfs.GridFS(mdb)
+            file_data = file.read()
+            file_id = fs.put(file_data, filename=file.filename, content_type=file.content_type)
+            
+            rel_path = f"/api/constellation/file/{str(file_id)}"
+            from datetime import datetime as _dt
+            now_str = _dt.utcnow().isoformat()
+            
+            msg_doc = {
+                'chat_id': chat_id,
+                'sender_key': current['_id'],
+                'content': None,
+                'file_path': rel_path,
+                'file_name': file.filename,
+                'file_type': file_type,
+                'created_at': now_str
+            }
+            inserted = mdb.messages.insert_one(msg_doc)
+            msg_id = str(inserted.inserted_id)
+            
+            normalized_name = file.filename.lower().replace('_', ' ').replace('-', ' ')
+            topics = _extract_topics(normalized_name)
+            if not topics:
+                topics = ['Shared Files']
+            
+            edges = []
+            for t in topics:
+                edges.append((file.filename, t))
+            _mongo_upsert_graph('chat', chat_id, [file.filename] + topics, edges)
+            
+            return jsonify({'success': True, 'id': msg_id, 'file_url': rel_path})
+            
         chat_id = int(chat_id_raw)
         fname = secure_filename(file.filename)
         ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
@@ -2639,16 +2702,11 @@ def create_app(config=None):
         file_type = 'pdf' if ext == 'pdf' else ('image' if ext in ('png','jpg','jpeg','webp') else 'note')
         from datetime import datetime as _dt
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership using SQLAlchemy models
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
+            
             # Save file (with Vercel read-only filesystem fallback)
             upload_dir = os.path.join(app.static_folder, 'uploads', 'constellation')
             now = _dt.utcnow()
@@ -2661,37 +2719,92 @@ def create_app(config=None):
             except OSError:
                 pass # Ignore Read-Only File System errors on Vercel
 
-            # Always use forward slashes so url_for('static') works on Windows too
             rel_path = 'uploads/constellation/' + unique_name
             now_str = now.isoformat()
-            cur.execute(
-                """INSERT INTO messages(chat_id, sender_id, content, file_path, file_name, file_type, created_at)
-                   VALUES(?,?,NULL,?,?,?,?)""",
-                (chat_id, me, rel_path, file.filename, file_type, now_str)
+            
+            # Insert message
+            msg = ConstellationMessage(
+                chat_id=chat_id,
+                sender_id=me,
+                content=None,
+                file_path=rel_path,
+                file_name=file.filename,
+                file_type=file_type,
+                created_at=now_str
             )
-            msg_id = cur.lastrowid
-            conn.commit()
+            db.session.add(msg)
+            db.session.flush()
+            msg_id = msg.id
+            
             # Create a file node in the graph
             node_label = file.filename
-            nid_file = _upsert_node(cur, chat_id, node_label, 'file', msg_id, now_str)
+            nid_file = ConstellationNode.query.filter_by(chat_id=chat_id, label=node_label).first()
+            if not nid_file:
+                nid_file = ConstellationNode(chat_id=chat_id, label=node_label, node_type='file', source_message_id=msg_id, mention_count=1, created_at=now_str)
+                db.session.add(nid_file)
+                db.session.flush()
+            else:
+                nid_file.mention_count += 1
+                db.session.add(nid_file)
+                db.session.flush()
 
             linked_topics = set()
-
-            # 1) Normalize filename (replace _ and - with space) so multi-word topics match
             normalized_name = file.filename.lower().replace('_', ' ').replace('-', ' ')
             for topic in _extract_topics(normalized_name):
-                nid_topic = _upsert_node(cur, chat_id, topic, 'topic', msg_id, now_str)
-                _upsert_edge(cur, chat_id, nid_file, nid_topic)
+                nid_topic = ConstellationNode.query.filter_by(chat_id=chat_id, label=topic).first()
+                if not nid_topic:
+                    nid_topic = ConstellationNode(chat_id=chat_id, label=topic, node_type='topic', source_message_id=msg_id, mention_count=1, created_at=now_str)
+                    db.session.add(nid_topic)
+                    db.session.flush()
+                else:
+                    nid_topic.mention_count += 1
+                    db.session.add(nid_topic)
+                    db.session.flush()
+                
+                # Add edge
+                edge = ConstellationEdge.query.filter_by(chat_id=chat_id, source_node_id=nid_file.id, target_node_id=nid_topic.id).first()
+                if not edge:
+                    edge2 = ConstellationEdge.query.filter_by(chat_id=chat_id, source_node_id=nid_topic.id, target_node_id=nid_file.id).first()
+                    if edge2:
+                        edge2.weight += 1
+                        db.session.add(edge2)
+                    else:
+                        new_edge = ConstellationEdge(chat_id=chat_id, source_node_id=nid_file.id, target_node_id=nid_topic.id, weight=1)
+                        db.session.add(new_edge)
+                else:
+                    edge.weight += 1
+                    db.session.add(edge)
+                
                 linked_topics.add(topic)
 
-            # 2) Fallback: if file still has zero connections, create a "Shared Files" hub
             if not linked_topics:
-                nid_hub = _upsert_node(cur, chat_id, 'Shared Files', 'topic', msg_id, now_str)
-                _upsert_edge(cur, chat_id, nid_file, nid_hub)
-            conn.commit()
-            conn.close()
+                nid_hub = ConstellationNode.query.filter_by(chat_id=chat_id, label='Shared Files').first()
+                if not nid_hub:
+                    nid_hub = ConstellationNode(chat_id=chat_id, label='Shared Files', node_type='topic', source_message_id=msg_id, mention_count=1, created_at=now_str)
+                    db.session.add(nid_hub)
+                    db.session.flush()
+                else:
+                    nid_hub.mention_count += 1
+                    db.session.add(nid_hub)
+                    db.session.flush()
+                
+                edge = ConstellationEdge.query.filter_by(chat_id=chat_id, source_node_id=nid_file.id, target_node_id=nid_hub.id).first()
+                if not edge:
+                    edge2 = ConstellationEdge.query.filter_by(chat_id=chat_id, source_node_id=nid_hub.id, target_node_id=nid_file.id).first()
+                    if edge2:
+                        edge2.weight += 1
+                        db.session.add(edge2)
+                    else:
+                        new_edge = ConstellationEdge(chat_id=chat_id, source_node_id=nid_file.id, target_node_id=nid_hub.id, weight=1)
+                        db.session.add(new_edge)
+                else:
+                    edge.weight += 1
+                    db.session.add(edge)
+                    
+            db.session.commit()
             return jsonify({'success': True, 'id': msg_id, 'file_url': url_for('static', filename=rel_path)})
         except Exception as e:
+            db.session.rollback()
             return jsonify({'error': str(e)}), 500
 
     # --- API: get graph data for constellation ---
@@ -2765,23 +2878,29 @@ def create_app(config=None):
         chat_id = int(chat_id)
         node_id = int(node_id)
         try:
-            dbp = _constellation_db_path()
-            conn = sqlite3.connect(dbp)
-            conn.row_factory = sqlite3.Row
-            _ensure_constellation_tables(conn)
-            cur = conn.cursor()
-            cur.execute("SELECT user1_id, user2_id FROM chats WHERE id=?", (chat_id,))
-            chat = cur.fetchone()
-            if not chat or me not in (chat['user1_id'], chat['user2_id']) or not _are_friends(cur, chat['user1_id'], chat['user2_id']):
-                conn.close()
+            # Verify membership using SQLAlchemy
+            chat = ConstellationChat.query.get(chat_id)
+            if not chat or me not in (chat.user1_id, chat.user2_id):
                 return jsonify({'error': 'forbidden'}), 403
             
-            cur.execute("DELETE FROM constellation_edges WHERE chat_id=? AND (source_node_id=? OR target_node_id=?)", (chat_id, node_id, node_id))
-            cur.execute("DELETE FROM constellation_nodes WHERE chat_id=? AND id=?", (chat_id, node_id))
-            conn.commit()
-            conn.close()
+            # Delete edges
+            ConstellationEdge.query.filter(
+                db.and_(
+                    ConstellationEdge.chat_id == chat_id,
+                    db.or_(
+                        ConstellationEdge.source_node_id == node_id,
+                        ConstellationEdge.target_node_id == node_id
+                    )
+                )
+            ).delete()
+            
+            # Delete node
+            ConstellationNode.query.filter_by(chat_id=chat_id, id=node_id).delete()
+            
+            db.session.commit()
             return jsonify({'success': True})
         except Exception as e:
+            db.session.rollback()
             return jsonify({'error': str(e)}), 500
 
     return app
