@@ -14,6 +14,11 @@ from models import db, User, ConstellationChat, ConstellationMessage, IdeaMessag
 from sqlalchemy import text, func
 
 try:
+    from flask_cors import CORS
+except ImportError:
+    CORS = None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
