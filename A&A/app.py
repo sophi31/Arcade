@@ -33,6 +33,13 @@ except ImportError:
     DESCENDING = -1
     PyMongoError = Exception
 
+try:
+    import cloudinary
+    import cloudinary.uploader
+    _CLOUDINARY_AVAILABLE = True
+except ImportError:
+    _CLOUDINARY_AVAILABLE = False
+
 # import blueprints safely (package vs script execution)
 try:
     from .games_api import games_bp
@@ -97,6 +104,10 @@ def create_app(config=None):
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
     db.init_app(app)
+
+    # Initialize CORS for cross-device WiFi support
+    if CORS is not None:
+        CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     # ---- Currency helpers ----
     @app.template_filter('inr')
@@ -172,6 +183,42 @@ def create_app(config=None):
         mdb.idea_messages.create_index([('chat_id', ASCENDING), ('created_at', ASCENDING)])
         mdb.graph_nodes.create_index([('chat_id', ASCENDING), ('label_lc', ASCENDING), ('mode', ASCENDING)], unique=True)
         mdb.graph_edges.create_index([('chat_id', ASCENDING), ('source_label_lc', ASCENDING), ('target_label_lc', ASCENDING), ('mode', ASCENDING)], unique=True)
+
+    def _cloudinary_configured():
+        """Return True if Cloudinary credentials are available (via CLOUDINARY_URL or individual vars)."""
+        if not _CLOUDINARY_AVAILABLE:
+            return False
+        cloud_url = (os.getenv('CLOUDINARY_URL') or '').strip()
+        if cloud_url:
+            return True
+        # Individual vars
+        return bool(os.getenv('CLOUDINARY_CLOUD_NAME') and os.getenv('CLOUDINARY_API_KEY') and os.getenv('CLOUDINARY_API_SECRET'))
+
+    def _cloudinary_upload(file_obj, folder='constellation', resource_type='auto'):
+        """Upload a file-like object to Cloudinary and return the secure URL."""
+        if not _CLOUDINARY_AVAILABLE:
+            return None, 'Cloudinary package not installed'
+        cloud_url = (os.getenv('CLOUDINARY_URL') or '').strip()
+        if cloud_url:
+            cloudinary.config(cloudinary_url=cloud_url)
+        else:
+            cloudinary.config(
+                cloud_name=os.getenv('CLOUDINARY_CLOUD_NAME', ''),
+                api_key=os.getenv('CLOUDINARY_API_KEY', ''),
+                api_secret=os.getenv('CLOUDINARY_API_SECRET', ''),
+                secure=True
+            )
+        try:
+            result = cloudinary.uploader.upload(
+                file_obj,
+                folder=folder,
+                resource_type=resource_type,
+                use_filename=True,
+                unique_filename=True
+            )
+            return result.get('secure_url'), None
+        except Exception as exc:
+            return None, str(exc)
 
     def _mongo_key(username):
         return (username or '').strip().lower()
@@ -386,6 +433,39 @@ def create_app(config=None):
         if 'user' not in session and 'user_id' not in session:
             return redirect(url_for('login'))
         return redirect(url_for('index'))
+
+    @app.route('/api/network-status')
+    def network_status():
+        """Network diagnostics endpoint for cross-device connectivity testing"""
+        import socket
+        try:
+            hostname = socket.gethostname()
+            ip_addr = socket.gethostbyname(hostname)
+            client_ip = request.remote_addr
+            return jsonify({
+                'status': 'online',
+                'server': {
+                    'hostname': hostname,
+                    'ip': ip_addr,
+                    'port': 5000,
+                    'urls': {
+                        'local': 'http://127.0.0.1:5000',
+                        'network': f'http://{ip_addr}:5000'
+                    }
+                },
+                'client': {
+                    'ip': client_ip,
+                    'user_agent': request.headers.get('User-Agent', 'Unknown')
+                },
+                'same_network': client_ip.startswith(ip_addr.rsplit('.', 1)[0]) if '.' in ip_addr and '.' in client_ip else False,
+                'timestamp': str(__import__('datetime').datetime.now().isoformat())
+            })
+        except Exception as e:
+            return jsonify({
+                'status': 'error',
+                'message': str(e),
+                'client_ip': request.remote_addr
+            }), 500
 
     @app.route('/login', methods=['GET', 'POST'])
     def login():
@@ -2264,12 +2344,17 @@ def create_app(config=None):
                     pass
             rows = []
             for r in mdb.messages.find(query).sort('created_at', ASCENDING).limit(100):
-                rows.append({
+                row = {
                     'id': str(r['_id']),
+                    # sender_id must match myKey format on the frontend (MongoDB _id = username string)
                     'sender_id': r.get('sender_key'),
                     'content': r.get('content'),
-                    'created_at': r.get('created_at')
-                })
+                    'created_at': r.get('created_at'),
+                    'file_url': r.get('file_url'),
+                    'file_name': r.get('file_name'),
+                    'file_type': r.get('file_type'),
+                }
+                rows.append(row)
             return jsonify(rows)
         
         # Use SQLAlchemy models
@@ -2434,7 +2519,10 @@ def create_app(config=None):
                 'id': str(r['_id']),
                 'sender_id': r.get('sender_key'),
                 'content': r.get('content'),
-                'created_at': r.get('created_at')
+                'created_at': r.get('created_at'),
+                'file_url': r.get('file_url'),
+                'file_name': r.get('file_name'),
+                'file_type': r.get('file_type'),
             } for r in mdb.idea_messages.find(query).sort('created_at', ASCENDING).limit(100)]
             return jsonify(rows)
         
@@ -2628,15 +2716,66 @@ def create_app(config=None):
         file = request.files.get('file')
         if not chat_id_raw or not file or not getattr(file, 'filename', ''):
             return jsonify({'error': 'chat_id and file required'}), 400
-        if _mongo_available():
-            return jsonify({'error': 'File uploads are not available on Vercel Mongo chat yet'}), 400
-        chat_id = int(chat_id_raw)
+
         fname = secure_filename(file.filename)
         ext = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
         allowed = {'pdf', 'png', 'jpg', 'jpeg', 'txt', 'doc', 'docx', 'xls', 'xlsx', 'webp'}
         if ext not in allowed:
             return jsonify({'error': f'File type .{ext} not allowed'}), 400
-        file_type = 'pdf' if ext == 'pdf' else ('image' if ext in ('png','jpg','jpeg','webp') else 'note')
+        file_type = 'pdf' if ext == 'pdf' else ('image' if ext in ('png', 'jpg', 'jpeg', 'webp') else 'note')
+
+        if _mongo_available():
+            # --- MongoDB / Vercel path: upload via Cloudinary ---
+            current = _mongo_current_user()
+            if not current:
+                return jsonify({'error': 'auth required'}), 401
+            if not _cloudinary_configured():
+                return jsonify({
+                    'error': 'File uploads require Cloudinary to be configured. '
+                             'Add CLOUDINARY_URL to your Vercel environment variables '
+                             '(free at cloudinary.com).'
+                }), 503
+            mdb = _mongo_db()
+            chat_id = str(chat_id_raw)
+            chat = mdb.chats.find_one({'chat_id': chat_id, 'participants': current['_id']})
+            if not chat:
+                return jsonify({'error': 'forbidden'}), 403
+            # Determine Cloudinary resource type
+            resource_type = 'image' if file_type == 'image' else 'raw'
+            file_url, err = _cloudinary_upload(file, folder='constellation', resource_type=resource_type)
+            if err:
+                return jsonify({'error': f'Upload failed: {err}'}), 500
+            from datetime import datetime as _dt
+            now = _dt.utcnow().isoformat()
+            topics = _extract_topics(fname.replace('_', ' ').replace('-', ' '))
+            edges = [(topics[i], topics[j]) for i in range(len(topics)) for j in range(i + 1, len(topics))]
+            inserted = mdb.messages.insert_one({
+                'chat_id': chat_id,
+                'sender_key': current['_id'],
+                'content': None,
+                'file_url': file_url,
+                'file_name': file.filename,
+                'file_type': file_type,
+                'created_at': now
+            })
+            # Upsert file node and related topic nodes in graph
+            normalized_name = fname.lower().replace('_', ' ').replace('-', ' ')
+            file_label = file.filename
+            mdb.graph_nodes.update_one(
+                {'chat_id': chat_id, 'mode': 'chat', 'label_lc': file_label.lower()},
+                {'$setOnInsert': {'chat_id': chat_id, 'mode': 'chat', 'label': file_label, 'node_type': 'file'},
+                 '$inc': {'mention_count': 1}},
+                upsert=True
+            )
+            if topics:
+                _mongo_upsert_graph('chat', chat_id, topics, edges)
+            else:
+                # Fallback hub node
+                _mongo_upsert_graph('chat', chat_id, ['Shared Files'], [])
+            return jsonify({'success': True, 'id': str(inserted.inserted_id), 'file_url': file_url})
+
+        # --- SQLite / local path ---
+        chat_id = int(chat_id_raw)
         from datetime import datetime as _dt
         try:
             dbp = _constellation_db_path()
@@ -2654,12 +2793,12 @@ def create_app(config=None):
             now = _dt.utcnow()
             unique_name = f"c{chat_id}_u{me}_{int(now.timestamp())}_{fname}"
             abs_path = os.path.join(upload_dir, unique_name)
-            
+
             try:
                 os.makedirs(upload_dir, exist_ok=True)
                 file.save(abs_path)
             except OSError:
-                pass # Ignore Read-Only File System errors on Vercel
+                pass  # Ignore Read-Only File System errors on Vercel
 
             # Always use forward slashes so url_for('static') works on Windows too
             rel_path = 'uploads/constellation/' + unique_name

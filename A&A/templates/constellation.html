@@ -308,7 +308,11 @@ const OPEN_UID = {% if open_uid is defined %}{{ open_uid | tojson }}{% else %}nu
 let activeChatId = null;
 let activeOtherUid = null;
 let knownFriends = [];
+// myKey will be set to the correct identity (numeric string locally, username string on MongoDB/Vercel)
+// It must be set before any message comparison. Use meReady to gate dependent calls.
 let myKey = String(ME || '');
+let meReadyResolve;
+const meReady = new Promise(res => { meReadyResolve = res; });
 let lastMsgId = { chat: 0, ideas: 0 };
 let pollTimer = null;
 let simulation = null;
@@ -345,9 +349,15 @@ async function loadMe(){
     const r = await fetch('/api/constellation/me');
     const me = await r.json();
     if(me.handle) document.getElementById('my-handle').textContent = me.handle;
+    // Use the id returned by the API as myKey — this is a numeric string locally
+    // and a username string in MongoDB/Vercel mode. Both sides of the chat
+    // must use the same id type for sent-vs-received to work.
     if(me.id) myKey = String(me.id);
   } catch(e){
     document.getElementById('my-handle').textContent = 'unavailable';
+  } finally {
+    // Always resolve meReady so dependent callers aren't blocked forever
+    meReadyResolve();
   }
 }
 
@@ -424,6 +434,8 @@ document.getElementById('friend-form').addEventListener('submit', async e => {
 async function loadUsers(){
   const list = document.getElementById('user-list');
   try{
+    // Wait for myKey to be set correctly before we can detect which chat is ours
+    await meReady;
     const r = await fetch('/api/constellation/users');
     const users = await r.json();
     knownFriends = Array.isArray(users) ? users : [];
@@ -514,12 +526,14 @@ async function loadMessages(initial = false){
     if(!Array.isArray(msgs) || msgs.length === 0) return;
     const box = document.getElementById('messages');
     msgs.forEach(m => {
-      const sent = String(m.sender_id) === String(ME) || String(m.sender_id) === myKey;
+      // myKey is guaranteed to be set (either numeric string locally, username string in MongoDB/Vercel)
+      // sender_id in the API response matches the same format as myKey in both backends
+      const sent = String(m.sender_id) === myKey;
       const bubble = document.createElement('div');
       bubble.className = `msg-bubble ${sent ? 'sent' : 'recv'} ${activeMode === 'ideas' ? 'idea' : ''}`;
       bubble.dataset.msgId = m.id;
-      if(m.file_path && m.file_url){
-        const icon = m.file_type === 'pdf' ? 'PDF' : m.file_type === 'image' ? 'IMG' : 'FILE';
+      if(m.file_url){
+        const icon = m.file_type === 'pdf' ? '📄 PDF' : m.file_type === 'image' ? '🖼 IMG' : '📎 FILE';
         bubble.innerHTML = `<a class="msg-file" href="${m.file_url}" target="_blank" rel="noopener">
           <span class="file-icon">${icon}</span>
           <div class="file-info">
@@ -531,6 +545,7 @@ async function loadMessages(initial = false){
         bubble.innerHTML = `${escHtml(m.content || '')}<div class="msg-time">${fmtTime(m.created_at)}</div>`;
       }
       box.appendChild(bubble);
+      // Track the latest message id (numeric for SQLite, string ObjectId for MongoDB)
       if(typeof m.id === 'number'){
         lastMsgId[activeMode] = Math.max(Number(lastMsgId[activeMode] || 0), m.id);
       } else {
@@ -820,18 +835,23 @@ function highlightInChat(d){
 
 function fmtTime(iso){
   if(!iso) return '';
-  try{ return new Date(iso + 'Z').toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
-  catch{ return ''; }
+  try{
+    // Avoid double-Z: MongoDB ISO strings already end with 'Z'
+    const normalized = iso.endsWith('Z') ? iso : iso + 'Z';
+    return new Date(normalized).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  } catch{ return ''; }
 }
 function truncate(s, n){ return s && s.length > n ? s.slice(0, n) + '...' : s; }
 function escHtml(s){
   return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-loadMe();
-loadFriendRequests();
-loadUsers();
-setInterval(async () => { await loadFriendRequests(); await loadUsers(); }, 5000);
+// loadMe() must complete first so myKey is correct before loadUsers() opens any chat
+loadMe().then(() => {
+  loadFriendRequests();
+  loadUsers();
+  setInterval(async () => { await loadFriendRequests(); await loadUsers(); }, 5000);
+});
 window.addEventListener('resize', () => { if(activeChatId) refreshGraph(); });
 </script>
 </body>
